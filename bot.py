@@ -2,12 +2,14 @@ import asyncio
 import json
 import logging
 import random
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -23,18 +25,34 @@ log = logging.getLogger(__name__)
 
 cfg = Config.from_env()
 bot = Bot(token=cfg.bot_token)
-router = Router()
+cmd_router = Router(name="commands")
+router = Router(name="states")
 
 _draw_timers: dict[int, asyncio.Task] = {}
+_draw_deadlines: dict[int, datetime] = {}
 _pending_winners: dict[int, list[db.Participant]] = {}
 _admin_panels: dict[int, tuple[int, int]] = {}
 _button_update_tasks: dict[int, asyncio.Task] = {}
 
 
+class NewGame(StatesGroup):
+    waiting_name = State()
+
+
 class NewGiveaway(StatesGroup):
+    waiting_name = State()
     waiting_content = State()
     waiting_text_for_photo = State()
-    waiting_winner_count = State()
+
+
+class EditGiveaway(StatesGroup):
+    waiting_name = State()
+    waiting_photo = State()
+    waiting_text = State()
+
+
+class PublishGiveaway(StatesGroup):
+    waiting_custom_time = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -85,45 +103,109 @@ def _kb_finished(gid: int, count: int) -> InlineKeyboardMarkup:
 
 
 def _kb_control(gid: int, count: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🎲 Разыграть ({count})", callback_data=f"drw:{gid}")],
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"ref:{gid}")],
-    ])
+    g = db.get_giveaway(gid)
+    buttons = [
+        [InlineKeyboardButton(text=f"⚡ Определить победителя сейчас ({count})", callback_data=f"drw:{gid}")],
+        [InlineKeyboardButton(text=f"👤 Выбрать из списка ({count})", callback_data=f"pick:{gid}:0")],
+        [InlineKeyboardButton(text="🔄 Обновить кол-во участников", callback_data=f"ref:{gid}")],
+        [InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")],
+    ]
+    if g and g.game_id:
+        buttons.append([InlineKeyboardButton(text="🎮 Назад к игре", callback_data=f"game:{g.game_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _kb_active_list(active: list[db.Giveaway]) -> InlineKeyboardMarkup:
+    buttons = []
+    for g in active:
+        label = g.prize_text[:30] + ("…" if len(g.prize_text) > 30 else "")
+        count = db.participant_count(g.id)
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🟢 #{g.id}: {label} ({count} уч.)",
+                callback_data=f"act:{g.id}",
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="🎮 К играм", callback_data="show_games")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _remaining_time(gid: int) -> str:
+    deadline = _draw_deadlines.get(gid)
+    if not deadline:
+        g = db.get_giveaway(gid)
+        if g and g.draw_deadline:
+            deadline = datetime.fromisoformat(g.draw_deadline)
+        else:
+            return "✋ Ручной режим"
+    now = datetime.now(timezone.utc)
+    diff = (deadline - now).total_seconds()
+    if diff <= 0:
+        return "⏱ Розыгрыш вот-вот начнётся"
+    minutes = int(diff // 60)
+    seconds = int(diff % 60)
+    if minutes > 0:
+        return f"⏱ До розыгрыша: {minutes} мин {seconds} сек"
+    return f"⏱ До розыгрыша: {seconds} сек"
 
 
 def _kb_winner(gid: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    g = db.get_giveaway(gid)
+    buttons = [
         [
             InlineKeyboardButton(text="🔄 Перевыбрать", callback_data=f"rr:{gid}"),
             InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"cfm:{gid}"),
         ],
-    ])
-
-
-def _kb_queue(queue: list[db.Giveaway]) -> InlineKeyboardMarkup:
-    buttons = []
-    for g in queue:
-        label = g.prize_text[:30] + ("…" if len(g.prize_text) > 30 else "")
-        icon = "🖼" if g.photo_id else "📝"
-        winners_mark = f" ×{g.winner_count}" if g.winner_count > 1 else ""
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{icon} #{g.id}: {label}{winners_mark}",
-                callback_data="noop",
-            ),
-            InlineKeyboardButton(text="🗑", callback_data=f"del:{g.id}"),
-        ])
+        [InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")],
+    ]
+    if g and g.game_id:
+        buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def _kb_winner_count() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="1", callback_data="wc:1"),
-            InlineKeyboardButton(text="2", callback_data="wc:2"),
-            InlineKeyboardButton(text="3", callback_data="wc:3"),
-        ],
+def _giveaway_label(g: db.Giveaway) -> str:
+    if g.name:
+        return g.name[:30] + ("…" if len(g.name) > 30 else "")
+    return g.prize_text[:30] + ("…" if len(g.prize_text) > 30 else "")
+
+
+PAGE_SIZE = 10
+
+
+def _paginate(items: list, page: int) -> tuple[list, int]:
+    total_pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PAGE_SIZE
+    return items[start:start + PAGE_SIZE], total_pages
+
+
+def _kb_game_giveaways(game: db.Game, queue: list[db.Giveaway], page: int = 0) -> InlineKeyboardMarkup:
+    page_items, total_pages = _paginate(queue, page)
+    buttons = []
+    for g in page_items:
+        label = _giveaway_label(g)
+        icon = "🖼" if g.photo_id else "📝"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{icon} #{g.id}: {label}",
+                callback_data=f"view:{g.id}",
+            ),
+        ])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"gpage:{game.id}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"gpage:{game.id}:{page + 1}"))
+        buttons.append(nav)
+    buttons.append([
+        InlineKeyboardButton(text="➕ Новый розыгрыш", callback_data=f"gadd:{game.id}"),
+        InlineKeyboardButton(text="📚 Из библиотеки", callback_data=f"glib:{game.id}"),
     ])
+    buttons.append([InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")])
+    buttons.append([InlineKeyboardButton(text="◀️ К списку игр", callback_data="show_games")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # ── Debounced button count update on channel post ────────
@@ -153,37 +235,445 @@ async def _do_button_update(gid: int) -> None:
 
 # ── /start ───────────────────────────────────────────────
 
-@router.message(Command("start"))
+@cmd_router.message(Command("start", "menu"))
 async def cmd_start(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
+    cd = _cooldown()
     await message.answer(
-        "🎲 Бот-рандомайзер для розыгрышей\n\n"
-        "/new — создать розыгрыш\n"
-        "/queue — очередь розыгрышей\n"
-        "/next — опубликовать следующий\n"
-        "/finish — завершить активный без победителя\n"
-        "/cooldown [мин] — настройка кулдауна\n"
-        "/winners — победители на кулдауне\n"
-        "/resetcooldowns — сбросить все кулдауны\n"
-        "/cancel — отмена"
+        "🎲 Бот-рандомайзер для розыгрышей",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎮 Мои игры", callback_data="show_games")],
+            [InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")],
+            [InlineKeyboardButton(text=f"⏳ Кулдаун: {cd} мин", callback_data="show_cooldown")],
+            [InlineKeyboardButton(text="🏆 Победители на кулдауне", callback_data="show_winners")],
+            [InlineKeyboardButton(text="🔄 Сброс кулдауна", callback_data="reset_cooldowns")],
+        ]),
     )
 
 
-# ── Create giveaway (single-step) ───────────────────────
+# ── Game management ──────────────────────────────────────
 
-@router.message(Command("new", "newgiveaway"))
+@cmd_router.message(Command("newgame"))
+async def cmd_newgame(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        name = parts[1].strip()
+        gid = db.add_game(name)
+        await message.answer(
+            f"🎮 Игра «{name}» создана!\n\nДобавляй розыгрыши:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Добавить розыгрыш", callback_data=f"gadd:{gid}")],
+                [InlineKeyboardButton(text="◀️ К списку игр", callback_data="show_games")],
+            ]),
+        )
+    else:
+        await state.clear()
+        await message.answer("🎮 Введи название игры:")
+        await state.set_state(NewGame.waiting_name)
+
+
+@router.message(NewGame.waiting_name, F.text)
+async def on_game_name(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    name = message.text.strip()
+    if not name:
+        await message.answer("Название не может быть пустым.")
+        return
+    gid = db.add_game(name)
+    await state.clear()
+    await message.answer(
+        f"🎮 Игра «{name}» создана!\n\nДобавляй розыгрыши:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить розыгрыш", callback_data=f"gadd:{gid}")],
+            [InlineKeyboardButton(text="◀️ К списку игр", callback_data="show_games")],
+        ]),
+    )
+
+
+@cmd_router.message(Command("games"))
+async def cmd_games(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await _show_games(message.chat.id)
+
+
+async def _show_games(chat_id: int, message_id: int | None = None) -> None:
+    games = db.get_games()
+    if not games:
+        text = "🎮 Нет игр."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Создать игру", callback_data="new_game")],
+            [InlineKeyboardButton(text="◀️ Меню", callback_data="go_menu")],
+        ])
+        if message_id:
+            try:
+                await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
+                return
+            except Exception:
+                pass
+        await bot.send_message(chat_id, text, reply_markup=kb)
+        return
+
+    buttons = []
+    for g in games:
+        queued, active, finished = db.game_giveaway_count(g.id)
+        status = ""
+        if active > 0:
+            status += f" 🟢{active}"
+        if queued > 0:
+            status += f" 📋{queued}"
+        if finished > 0:
+            status += f" ✅{finished}"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🎮 {g.name}{status}",
+                callback_data=f"game:{g.id}",
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="➕ Создать игру", callback_data="new_game")])
+    buttons.append([InlineKeyboardButton(text="◀️ Меню", callback_data="go_menu")])
+
+    text = f"🎮 Мои игры ({len(games)}):"
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if message_id:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "show_games")
+async def on_show_games(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    await _show_games(cb.message.chat.id, cb.message.message_id)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "new_game")
+async def on_new_game(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    await state.clear()
+    await cb.message.edit_text("🎮 Введи название игры:")
+    await state.set_state(NewGame.waiting_name)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("game:"))
+async def on_game(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    game_id = int(cb.data.split(":")[1])
+    game = db.get_game(game_id)
+    if not game:
+        await cb.answer("Игра не найдена")
+        return
+    await _show_game(cb.message.chat.id, game, cb.message.message_id)
+    await cb.answer()
+
+
+async def _show_game(chat_id: int, game: db.Game, message_id: int | None = None) -> None:
+    queue = db.get_queued(game.id)
+    queued, active, finished = db.game_giveaway_count(game.id)
+    text = (
+        f"🎮 {game.name}\n\n"
+        f"📋 В очереди: {queued}\n"
+        f"🟢 Активных: {active}\n"
+        f"✅ Завершено: {finished}"
+    )
+    kb = _kb_game_giveaways(game, queue)
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(text="🗑 Удалить игру", callback_data=f"delask:{game.id}")
+    ])
+
+    if message_id:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("delask:"))
+async def on_delete_game_ask(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    game_id = int(cb.data.split(":")[1])
+    game = db.get_game(game_id)
+    if not game:
+        await cb.answer("Не найдена")
+        return
+    queued, active, finished = db.game_giveaway_count(game_id)
+    text = (
+        f"❗ Удалить игру «{game.name}»?\n\n"
+        f"📋 В очереди: {queued}\n"
+        f"🟢 Активных: {active}\n"
+        f"✅ Завершено: {finished}\n\n"
+        "Розыгрыши не удалятся — переместятся в библиотеку."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delgame:{game_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"game:{game_id}"),
+        ],
+    ])
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cb.message.answer(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("delgame:"))
+async def on_delete_game(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    game_id = int(cb.data.split(":")[1])
+    game = db.get_game(game_id)
+    if not game:
+        await cb.answer("Не найдена")
+        return
+    db.delete_game(game_id)
+    await _show_games(cb.message.chat.id, cb.message.message_id)
+    await cb.answer(f"Игра «{game.name}» удалена — розыгрыши сохранены в библиотеке")
+
+
+# ── Library (free giveaways) ────────────────────────────
+
+async def _show_library(chat_id: int, message_id: int | None = None, page: int = 0) -> None:
+    free = db.get_free_giveaways()
+    if not free:
+        text = "📚 Библиотека пуста."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить розыгрыш", callback_data="go_new_lib")],
+            [InlineKeyboardButton(text="◀️ Меню", callback_data="go_menu")],
+        ])
+        if message_id:
+            try:
+                await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
+                return
+            except Exception:
+                pass
+        await bot.send_message(chat_id, text, reply_markup=kb)
+        return
+
+    page_items, total_pages = _paginate(free, page)
+    buttons = []
+    for g in page_items:
+        label = _giveaway_label(g)
+        icon = "🖼" if g.photo_id else "📝"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{icon} #{g.id}: {label}",
+                callback_data=f"view:{g.id}",
+            ),
+        ])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"libpage:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"libpage:{page + 1}"))
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="➕ Добавить розыгрыш", callback_data="go_new_lib")])
+    buttons.append([InlineKeyboardButton(text="◀️ Меню", callback_data="go_menu")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    text = f"📚 Библиотека розыгрышей ({len(free)}):"
+    if message_id:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "show_library")
+async def on_show_library(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    await _show_library(cb.message.chat.id, cb.message.message_id)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("libpage:"))
+async def on_lib_page(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    page = int(cb.data.split(":")[1])
+    await _show_library(cb.message.chat.id, cb.message.message_id, page)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("gpage:"))
+async def on_game_page(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    parts = cb.data.split(":")
+    game_id, page = int(parts[1]), int(parts[2])
+    game = db.get_game(game_id)
+    if not game:
+        await cb.answer("Игра не найдена")
+        return
+    queue = db.get_queued(game.id)
+    queued, active, finished = db.game_giveaway_count(game.id)
+    text = (
+        f"🎮 {game.name}\n\n"
+        f"📋 В очереди: {queued}\n"
+        f"🟢 Активных: {active}\n"
+        f"✅ Завершено: {finished}"
+    )
+    kb = _kb_game_giveaways(game, queue, page)
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(text="🗑 Удалить игру", callback_data=f"delask:{game.id}")
+    ])
+    try:
+        await bot.edit_message_text(text, chat_id=cb.message.chat.id, message_id=cb.message.message_id, reply_markup=kb)
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def on_noop(cb: CallbackQuery) -> None:
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("glib:"))
+async def on_game_library(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    game_id = int(cb.data.split(":")[1])
+    free = db.get_free_giveaways()
+    if not free:
+        await cb.answer("Библиотека пуста — все розыгрыши привязаны к играм")
+        return
+
+    buttons = []
+    for g in free:
+        label = _giveaway_label(g)
+        icon = "🖼" if g.photo_id else "📝"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{icon} #{g.id}: {label}",
+                callback_data=f"gpick:{game_id}:{g.id}",
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад к игре", callback_data=f"game:{game_id}")])
+
+    try:
+        await cb.message.edit_text(
+            f"📚 Библиотека розыгрышей ({len(free)}):\n"
+            "Нажми чтобы добавить в игру:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+    except Exception:
+        await cb.message.answer(
+            f"📚 Библиотека розыгрышей ({len(free)}):\n"
+            "Нажми чтобы добавить в игру:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("gpick:"))
+async def on_library_pick(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    parts = cb.data.split(":")
+    game_id, gid = int(parts[1]), int(parts[2])
+    db.assign_to_game(gid, game_id)
+    game = db.get_game(game_id)
+    if game:
+        await _show_game(cb.message.chat.id, game, cb.message.message_id)
+    await cb.answer(f"Розыгрыш #{gid} добавлен в игру")
+
+
+@router.callback_query(F.data.startswith("lib2game:"))
+async def on_lib_to_game(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    parts = cb.data.split(":")
+    gid, game_id = int(parts[1]), int(parts[2])
+    db.assign_to_game(gid, game_id)
+    game = db.get_game(game_id)
+    if game:
+        await _show_game(cb.message.chat.id, game, cb.message.message_id)
+    await cb.answer(f"Розыгрыш #{gid} добавлен в «{game.name}»" if game else f"Розыгрыш #{gid} добавлен")
+
+
+# ── Add giveaway to game ────────────────────────────────
+
+@router.callback_query(F.data.startswith("gadd:"))
+async def on_game_add(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    game_id = int(cb.data.split(":")[1])
+    await state.clear()
+    await state.update_data(game_id=game_id)
+    await bot.send_message(
+        chat_id=cb.message.chat.id,
+        text="✏️ Введи внутреннее название розыгрыша (видно только админам):",
+    )
+    await state.set_state(NewGiveaway.waiting_name)
+    await cb.answer()
+
+
+# ── Create giveaway ──────────────────────────────────────
+
+@cmd_router.message(Command("new"))
 async def cmd_new(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
-    await state.clear()
+    games = db.get_games()
+    if not games:
+        await message.answer("Сначала создай игру: /newgame")
+        return
+    if len(games) == 1:
+        await state.clear()
+        await state.update_data(game_id=games[0].id)
+        await message.answer(
+            f"🎮 Игра: {games[0].name}\n\n"
+            "✏️ Введи внутреннее название розыгрыша (видно только админам):",
+        )
+        await state.set_state(NewGiveaway.waiting_name)
+    else:
+        buttons = [
+            [InlineKeyboardButton(text=f"🎮 {g.name}", callback_data=f"gadd:{g.id}")]
+            for g in games
+        ]
+        await message.answer("Выбери игру для розыгрыша:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.message(NewGiveaway.waiting_name, F.text)
+async def on_giveaway_name(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await state.update_data(giveaway_name=message.text.strip())
     await message.answer(
-        "🎁 Отправь пост для розыгрыша:\n"
+        "🎁 Теперь отправь пост для розыгрыша:\n"
         "• фото с подписью (текст + фото в одном сообщении)\n"
         "• или просто текст\n\n"
-        "Можно использовать форматирование: жирный, курсив, ссылки, эмодзи.",
+        "Можно использовать форматирование: жирный, курсив, ссылки, эмодзи."
     )
     await state.set_state(NewGiveaway.waiting_content)
+
+
+@router.message(NewGiveaway.waiting_name)
+async def on_giveaway_name_invalid(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Введи текстовое название. /cancel — отмена.")
 
 
 @router.message(NewGiveaway.waiting_content, F.photo)
@@ -191,7 +681,6 @@ async def on_content_photo(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
     photo_id = message.photo[-1].file_id
-
     if message.caption:
         entities_json = _serialize_entities(message.caption_entities)
         await state.update_data(
@@ -199,8 +688,7 @@ async def on_content_photo(message: Message, state: FSMContext) -> None:
             prize_text=message.caption,
             prize_entities=entities_json,
         )
-        await message.answer("🏆 Сколько победителей?", reply_markup=_kb_winner_count())
-        await state.set_state(NewGiveaway.waiting_winner_count)
+        await _save_giveaway(message, state)
     else:
         await state.update_data(photo_id=photo_id)
         await message.answer("✅ Фото получено. Теперь отправь описание приза:")
@@ -217,8 +705,7 @@ async def on_content_text(message: Message, state: FSMContext) -> None:
         prize_text=message.text,
         prize_entities=entities_json,
     )
-    await message.answer("🏆 Сколько победителей?", reply_markup=_kb_winner_count())
-    await state.set_state(NewGiveaway.waiting_winner_count)
+    await _save_giveaway(message, state)
 
 
 @router.message(NewGiveaway.waiting_content)
@@ -234,8 +721,7 @@ async def on_text_for_photo(message: Message, state: FSMContext) -> None:
         return
     entities_json = _serialize_entities(message.entities)
     await state.update_data(prize_text=message.text, prize_entities=entities_json)
-    await message.answer("🏆 Сколько победителей?", reply_markup=_kb_winner_count())
-    await state.set_state(NewGiveaway.waiting_winner_count)
+    await _save_giveaway(message, state)
 
 
 @router.message(NewGiveaway.waiting_text_for_photo)
@@ -245,50 +731,127 @@ async def on_text_for_photo_invalid(message: Message) -> None:
     await message.answer("Нужен текст. Отправь описание приза:")
 
 
-@router.callback_query(NewGiveaway.waiting_winner_count, F.data.startswith("wc:"))
-async def on_winner_count_btn(cb: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(cb.from_user.id):
-        return
-    count = int(cb.data.split(":")[1])
-    await _save_giveaway(cb.message, state, count)
-    await cb.answer()
-
-
-@router.message(NewGiveaway.waiting_winner_count, F.text)
-async def on_winner_count_text(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        count = int(message.text.strip())
-        if count < 1:
-            raise ValueError
-    except ValueError:
-        await message.answer("Введи число от 1. Или нажми кнопку.")
-        return
-    await _save_giveaway(message, state, count)
-
-
-async def _save_giveaway(message: Message, state: FSMContext, winner_count: int) -> None:
+async def _save_giveaway(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
+    game_id = data.get("game_id")
     gid = db.add_giveaway(
         prize_text=data["prize_text"],
         prize_entities=data.get("prize_entities"),
         photo_id=data.get("photo_id"),
-        winner_count=winner_count,
+        game_id=game_id,
+        name=data.get("giveaway_name"),
     )
     await state.clear()
-    queue = db.get_queued()
-    winners_label = f", победителей: {winner_count}" if winner_count > 1 else ""
-    await message.answer(
-        f"✅ Розыгрыш #{gid} сохранён{winners_label}\n"
-        f"📋 В очереди: {len(queue)}\n\n"
-        "/next — опубликовать | /new — добавить ещё"
+
+    game = db.get_game(game_id) if game_id else None
+
+    buttons = [
+        [InlineKeyboardButton(text="➕ Добавить ещё", callback_data=f"gadd:{game_id}" if game_id else "go_new_lib")],
+    ]
+    if game_id:
+        queue = db.get_queued(game_id)
+        count_label = f"📋 В очереди: {len(queue)}"
+        buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{game_id}")])
+    else:
+        free = db.get_free_giveaways()
+        count_label = f"📚 В библиотеке: {len(free)}"
+        buttons.append([InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")])
+
+    game_label = f" в игру «{game.name}»" if game else ""
+    await bot.send_message(
+        chat_id=message.chat.id,
+        text=(
+            f"✅ Розыгрыш #{gid} сохранён{game_label}\n"
+            f"{count_label}"
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
+
+
+@router.callback_query(F.data == "go_new")
+async def on_go_new(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await state.clear()
+    await bot.send_message(
+        chat_id=cb.message.chat.id,
+        text="✏️ Введи внутреннее название розыгрыша (видно только админам):",
+    )
+    await state.set_state(NewGiveaway.waiting_name)
+    await cb.answer()
 
 
 # ── /cancel ──────────────────────────────────────────────
 
-@router.message(Command("cancel"), StateFilter("*"))
+@router.callback_query(F.data == "go_new_lib")
+async def on_new_lib(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    await state.clear()
+    await bot.send_message(
+        chat_id=cb.message.chat.id,
+        text="✏️ Введи внутреннее название розыгрыша (видно только админам):",
+    )
+    await state.set_state(NewGiveaway.waiting_name)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "go_menu")
+async def on_go_menu(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    cd = _cooldown()
+    try:
+        await cb.message.edit_text(
+            "🎲 Бот-рандомайзер для розыгрышей",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎮 Мои игры", callback_data="show_games")],
+                [InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")],
+                [InlineKeyboardButton(text=f"⏳ Кулдаун: {cd} мин", callback_data="show_cooldown")],
+                [InlineKeyboardButton(text="🏆 Победители на кулдауне", callback_data="show_winners")],
+                [InlineKeyboardButton(text="🔄 Сброс кулдауна", callback_data="reset_cooldowns")],
+            ]),
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@router.callback_query(F.data == "show_cooldown")
+async def on_show_cooldown(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    cd = _cooldown()
+    await cb.answer(f"⏳ Кулдаун: {cd} мин\n\nИзменить: /cooldown 90", show_alert=True)
+
+
+@router.callback_query(F.data == "show_winners")
+async def on_show_winners(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    cd = _cooldown()
+    rows = db.recent_winners(cd)
+    if not rows:
+        await cb.answer("Нет победителей на кулдауне", show_alert=True)
+        return
+    lines = [f"🏆 Победители (кулдаун {cd} мин):\n"]
+    for name, username, prize in rows:
+        who = f"@{username}" if username else name
+        lines.append(f"• {who} — {prize[:30]}")
+    await bot.send_message(cb.message.chat.id, "\n".join(lines))
+    await cb.answer()
+
+
+@router.callback_query(F.data == "reset_cooldowns")
+async def on_reset_cooldowns(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    n = db.clear_winners()
+    await cb.answer(f"✅ Кулдауны сброшены ({n} записей)", show_alert=True)
+
+
+@cmd_router.message(Command("cancel"), StateFilter("*"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
@@ -296,89 +859,343 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await message.answer("Отменено.")
 
 
-# ── /queue ───────────────────────────────────────────────
+# ── /active ──────────────────────────────────────────────
 
-@router.message(Command("queue"))
-async def cmd_queue(message: Message) -> None:
+@cmd_router.message(Command("active"))
+async def cmd_active(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
-    queue = db.get_queued()
-    if not queue:
-        await message.answer("📋 Очередь пуста. /new — создать розыгрыш.")
+    active = db.get_all_active()
+    if not active:
+        await message.answer("Нет активных розыгрышей.")
         return
-    await message.answer(f"📋 Очередь ({len(queue)}):", reply_markup=_kb_queue(queue))
+    await message.answer(
+        f"🟢 Активные розыгрыши ({len(active)}):",
+        reply_markup=_kb_active_list(active),
+    )
 
 
-@router.callback_query(F.data == "noop")
-async def on_noop(cb: CallbackQuery) -> None:
+@router.callback_query(F.data == "show_active")
+async def on_show_active(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    active = db.get_all_active()
+    if not active:
+        await cb.answer("Нет активных розыгрышей")
+        return
+    await cb.message.answer(
+        f"🟢 Активные розыгрыши ({len(active)}):",
+        reply_markup=_kb_active_list(active),
+    )
     await cb.answer()
 
+
+# ── View giveaway from queue ────────────────────────────
+
+@router.callback_query(F.data.startswith("view:"))
+async def on_view_giveaway(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    g = db.get_giveaway(gid)
+    if not g:
+        await cb.answer("Не найден")
+        return
+    entities = _deserialize_entities(g.prize_entities)
+    if g.photo_id:
+        await cb.message.answer_photo(
+            photo=g.photo_id,
+            caption=g.prize_text,
+            caption_entities=entities,
+        )
+    else:
+        await bot.send_message(
+            chat_id=cb.message.chat.id,
+            text=g.prize_text,
+            entities=entities,
+        )
+
+    top_buttons: list[list[InlineKeyboardButton]] = []
+    if g.game_id:
+        top_buttons = [
+            [InlineKeyboardButton(text=f"📢 {ch.label}", callback_data=f"ch:{i}:{gid}")]
+            for i, ch in enumerate(cfg.channels)
+        ]
+    else:
+        games = db.get_games()
+        if games:
+            for gm in games:
+                top_buttons.append([
+                    InlineKeyboardButton(
+                        text=f"🎮 Добавить в «{gm.name}»",
+                        callback_data=f"lib2game:{gid}:{gm.id}",
+                    )
+                ])
+    name_label = g.name or "—"
+    edit_buttons = [
+        [InlineKeyboardButton(text=f"📝 Название: {name_label}", callback_data=f"ednm:{gid}")],
+        [
+            InlineKeyboardButton(text="🖼 Заменить фото", callback_data=f"edph:{gid}"),
+            InlineKeyboardButton(text="✏️ Заменить текст", callback_data=f"edtx:{gid}"),
+        ],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{gid}")],
+    ]
+    if g.game_id:
+        edit_buttons.append([InlineKeyboardButton(text="🎮 Назад к игре", callback_data=f"game:{g.game_id}")])
+    else:
+        edit_buttons.append([InlineKeyboardButton(text="📚 Назад в библиотеку", callback_data="show_library")])
+
+    title = f"🎁 Розыгрыш #{g.id}"
+    if g.game_id:
+        title += "\n\nОпубликовать или отредактировать:"
+    else:
+        title += "\n\nДобавить в игру или отредактировать:"
+
+    await cb.message.answer(
+        title,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=top_buttons + edit_buttons),
+    )
+    await cb.answer()
+
+
+# ── Edit giveaway ────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("ednm:"))
+async def on_edit_name(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    g = db.get_giveaway(gid)
+    if not g or g.status not in ("queued", "finished"):
+        await cb.answer("Розыгрыш недоступен")
+        return
+    await state.update_data(edit_gid=gid)
+    await state.set_state(EditGiveaway.waiting_name)
+    await cb.message.edit_text(f"✏️ Введи новое название для розыгрыша #{gid}:")
+    await cb.answer()
+
+
+@router.message(EditGiveaway.waiting_name, F.text)
+async def on_edit_name_received(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    gid = data["edit_gid"]
+    db.update_giveaway(gid, name=message.text.strip())
+    g = db.get_giveaway(gid)
+    await state.clear()
+    buttons = [[InlineKeyboardButton(text="👁 Посмотреть", callback_data=f"view:{gid}")]]
+    if g and g.game_id:
+        buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
+    else:
+        buttons.append([InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")])
+    await message.answer(
+        f"✅ Название розыгрыша #{gid} обновлено.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.message(EditGiveaway.waiting_name)
+async def on_edit_name_invalid(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Введи текстовое название. /cancel — отмена.")
+
+
+@router.callback_query(F.data.startswith("edph:"))
+async def on_edit_photo(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    g = db.get_giveaway(gid)
+    if not g or g.status != "queued":
+        await cb.answer("Розыгрыш недоступен")
+        return
+    await state.update_data(edit_gid=gid)
+    await state.set_state(EditGiveaway.waiting_photo)
+    await cb.message.edit_text(f"🖼 Отправь новое фото для розыгрыша #{gid}:")
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("edtx:"))
+async def on_edit_text(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    g = db.get_giveaway(gid)
+    if not g or g.status != "queued":
+        await cb.answer("Розыгрыш недоступен")
+        return
+    await state.update_data(edit_gid=gid)
+    await state.set_state(EditGiveaway.waiting_text)
+    await cb.message.edit_text(f"✏️ Отправь новый текст для розыгрыша #{gid}:")
+    await cb.answer()
+
+
+@router.message(EditGiveaway.waiting_photo, F.photo)
+async def on_edit_photo_received(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    gid = data["edit_gid"]
+    photo_id = message.photo[-1].file_id
+    db.update_giveaway(gid, photo_id=photo_id)
+    g = db.get_giveaway(gid)
+    await state.clear()
+    buttons = [[InlineKeyboardButton(text="👁 Посмотреть", callback_data=f"view:{gid}")]]
+    if g and g.game_id:
+        buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
+    else:
+        buttons.append([InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")])
+    await message.answer(
+        f"✅ Фото розыгрыша #{gid} обновлено.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.message(EditGiveaway.waiting_photo)
+async def on_edit_photo_invalid(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Отправь фото. /cancel — отмена.")
+
+
+@router.message(EditGiveaway.waiting_text, F.text)
+async def on_edit_text_received(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    gid = data["edit_gid"]
+    entities_json = _serialize_entities(message.entities)
+    db.update_giveaway(gid, prize_text=message.text, prize_entities=entities_json)
+    g = db.get_giveaway(gid)
+    await state.clear()
+    buttons = [[InlineKeyboardButton(text="👁 Посмотреть", callback_data=f"view:{gid}")]]
+    if g and g.game_id:
+        buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
+    else:
+        buttons.append([InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")])
+    await message.answer(
+        f"✅ Текст розыгрыша #{gid} обновлён.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.message(EditGiveaway.waiting_text)
+async def on_edit_text_invalid(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Отправь текст. /cancel — отмена.")
+
+
+# ── Delete giveaway ──────────────────────────────────────
 
 @router.callback_query(F.data.startswith("del:"))
 async def on_delete(cb: CallbackQuery) -> None:
     if not is_admin(cb.from_user.id):
         return
     gid = int(cb.data.split(":")[1])
+    g = db.get_giveaway(gid)
+    game_id = g.game_id if g else None
     if db.delete_giveaway(gid):
-        queue = db.get_queued()
-        if queue:
-            await cb.message.edit_text(
-                f"📋 Очередь ({len(queue)}):", reply_markup=_kb_queue(queue)
-            )
-        else:
-            await cb.message.edit_text("📋 Очередь пуста.")
+        if game_id:
+            game = db.get_game(game_id)
+            if game:
+                await _show_game(cb.message.chat.id, game, cb.message.message_id)
+                await cb.answer(f"#{gid} удалён")
+                return
+        await _show_library(cb.message.chat.id, cb.message.message_id)
         await cb.answer(f"#{gid} удалён")
     else:
         await cb.answer("Не удалось удалить")
 
 
-# ── /next — publish next giveaway ────────────────────────
+# ── Active giveaway details ─────────────────────────────
 
-@router.message(Command("next"))
-async def cmd_next(message: Message) -> None:
-    if not is_admin(message.from_user.id):
+@router.callback_query(F.data.startswith("act:"))
+async def on_active_detail(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    g = db.get_giveaway(gid)
+    if not g or g.status != "active":
+        await cb.answer("Розыгрыш не найден или уже завершён")
         return
 
-    active = db.get_active()
-    if active:
-        count = db.participant_count(active.id)
-        await message.answer(
-            f"⚠️ Активный розыгрыш #{active.id}: {active.prize_text[:40]}\n"
-            f"👥 Участников: {count}\n\n"
-            "Заверши его или /finish для отмены.",
-            reply_markup=_kb_control(active.id, count),
-        )
-        return
+    count = db.participant_count(gid)
+    eligible = len(db.get_eligible(gid, _cooldown()))
+    timer_info = _remaining_time(gid)
+    channel_label = g.channel_id
+    for ch in cfg.channels:
+        if ch.id == g.channel_id:
+            channel_label = ch.label
+            break
 
-    queue = db.get_queued()
-    if not queue:
-        await message.answer("📋 Очередь пуста. /new — создать розыгрыш.")
-        return
-
-    g = queue[0]
-    entities = _deserialize_entities(g.prize_entities)
-    winners_label = f"\n🏆 Победителей: {g.winner_count}" if g.winner_count > 1 else ""
-
-    if g.photo_id:
-        await message.answer_photo(
-            photo=g.photo_id,
-            caption=g.prize_text,
-            caption_entities=entities,
-        )
-        await message.answer(f"🎁 Розыгрыш #{g.id}{winners_label}")
-    else:
-        await message.answer(
-            text=g.prize_text,
-            entities=entities,
-        )
-        await message.answer(f"🎁 Розыгрыш #{g.id}{winners_label}")
+    text = (
+        f"🟢 Активный розыгрыш #{g.id}\n\n"
+        f"🎁 {g.prize_text[:80]}\n"
+        f"📢 Канал: {channel_label}\n"
+        f"👥 Участников: {count} (подходящих: {eligible})\n"
+        f"{timer_info}"
+    )
 
     buttons = [
-        [InlineKeyboardButton(text=ch.label, callback_data=f"ch:{i}:{g.id}")]
-        for i, ch in enumerate(cfg.channels)
+        [InlineKeyboardButton(text=f"⚡ Определить победителя ({count})", callback_data=f"drw:{gid}")],
+        [InlineKeyboardButton(text=f"👤 Выбрать из списка ({count})", callback_data=f"pick:{gid}:0")],
+        [InlineKeyboardButton(text="🛑 Завершить досрочно", callback_data=f"frc:{gid}")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"act:{gid}")],
+        [InlineKeyboardButton(text="◀️ Назад к списку", callback_data="show_active")],
     ]
-    await message.answer("📢 Выбери канал:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    if g.game_id:
+        buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
 
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cb.message.answer(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("frc:"))
+async def on_force_finish(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    g = db.get_giveaway(gid)
+    if not g or g.status != "active":
+        await cb.answer("Розыгрыш не найден или уже завершён")
+        return
+
+    if gid in _draw_timers:
+        task = _draw_timers.pop(gid)
+        if not task.done():
+            task.cancel()
+    _draw_deadlines.pop(gid, None)
+    _pending_winners.pop(gid, None)
+    _admin_panels.pop(gid, None)
+
+    db.finish_giveaway(gid)
+    total = db.participant_count(gid)
+
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=g.channel_id,
+            message_id=g.channel_message_id,
+            reply_markup=_kb_finished(gid, total),
+        )
+    except Exception:
+        pass
+
+    await cb.message.edit_text(
+        f"🛑 Розыгрыш #{gid} завершён досрочно без победителя.\n"
+        f"🎁 {g.prize_text[:50]}\n"
+        f"👥 Участников было: {total}"
+    )
+    await cb.answer("Завершён!")
+
+
+# ── Publish giveaway ────────────────────────────────────
 
 @router.callback_query(F.data.startswith("ch:"))
 async def on_channel(cb: CallbackQuery) -> None:
@@ -393,13 +1210,15 @@ async def on_channel(cb: CallbackQuery) -> None:
         return
 
     await cb.message.edit_text(
-        "⏱ Когда разыграть?",
+        "⏱ Через сколько определить победителя?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
+                InlineKeyboardButton(text="⏱ 5 мин", callback_data=f"tm:5:{gid}:{ch_idx}"),
                 InlineKeyboardButton(text="⏱ 10 мин", callback_data=f"tm:10:{gid}:{ch_idx}"),
                 InlineKeyboardButton(text="⏱ 30 мин", callback_data=f"tm:30:{gid}:{ch_idx}"),
             ],
-            [InlineKeyboardButton(text="✋ Вручную", callback_data=f"tm:0:{gid}:{ch_idx}")],
+            [InlineKeyboardButton(text="✋ Сам нажму когда надо", callback_data=f"tm:0:{gid}:{ch_idx}")],
+            [InlineKeyboardButton(text="⌨️ Ввести время вручную", callback_data=f"tmc:{gid}:{ch_idx}")],
         ]),
     )
     await cb.answer()
@@ -411,10 +1230,47 @@ async def on_timing(cb: CallbackQuery) -> None:
         return
     parts = cb.data.split(":")
     minutes, gid, ch_idx = int(parts[1]), int(parts[2]), int(parts[3])
+    await _publish_giveaway(gid, ch_idx, minutes, cb.message.chat.id, cb.message.message_id)
+    await cb.answer()
 
+
+@router.callback_query(F.data.startswith("tmc:"))
+async def on_custom_time(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    parts = cb.data.split(":")
+    gid, ch_idx = int(parts[1]), int(parts[2])
+    await state.update_data(publish_gid=gid, publish_ch_idx=ch_idx)
+    await state.set_state(PublishGiveaway.waiting_custom_time)
+    await cb.message.edit_text("⌨️ Введи время в минутах (число):")
+    await cb.answer()
+
+
+@router.message(PublishGiveaway.waiting_custom_time, F.text)
+async def on_custom_time_received(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        minutes = int(message.text.strip())
+        if minutes < 1:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введи положительное число минут. /cancel — отмена.")
+        return
+
+    data = await state.get_data()
+    gid = data["publish_gid"]
+    ch_idx = data["publish_ch_idx"]
+    await state.clear()
+    await _publish_giveaway(gid, ch_idx, minutes, message.chat.id)
+
+
+async def _publish_giveaway(
+    gid: int, ch_idx: int, minutes: int, chat_id: int, edit_message_id: int | None = None
+) -> None:
     g = db.get_giveaway(gid)
     if not g or g.status != "queued":
-        await cb.answer("Розыгрыш недоступен")
+        await bot.send_message(chat_id, "Розыгрыш недоступен.")
         return
 
     channel = cfg.channels[ch_idx]
@@ -436,27 +1292,44 @@ async def on_timing(cb: CallbackQuery) -> None:
             reply_markup=_kb_participate(gid),
         )
 
-    db.activate_giveaway(gid, channel.id, msg.message_id)
+    if minutes > 0:
+        deadline = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        deadline_iso = deadline.isoformat()
+    else:
+        deadline = None
+        deadline_iso = None
+
+    db.activate_giveaway(gid, channel.id, msg.message_id, deadline_iso, chat_id)
     count = db.participant_count(gid)
 
     if minutes > 0:
         mode = f"⏱ Автоматический розыгрыш через {minutes} мин"
-        task = asyncio.create_task(_timer_draw(gid, minutes, cb.message.chat.id))
+        _draw_deadlines[gid] = deadline
+        task = asyncio.create_task(_timer_draw(gid, minutes, chat_id))
         _draw_timers[gid] = task
     else:
         mode = "✋ Ручной режим — разыграй когда будешь готов"
 
-    winners_label = f"🏆 Победителей: {g.winner_count}\n" if g.winner_count > 1 else ""
-    ctrl = await cb.message.edit_text(
+    text = (
         f"✅ Опубликовано в {channel.label}\n\n"
         f"🎁 {g.prize_text[:50]}\n"
-        f"{winners_label}"
         f"{mode}\n"
-        f"👥 Участников: {count}",
-        reply_markup=_kb_control(gid, count),
+        f"👥 Участников: {count}"
     )
-    _admin_panels[gid] = (cb.message.chat.id, ctrl.message_id)
-    await cb.answer()
+
+    if edit_message_id:
+        try:
+            ctrl = await bot.edit_message_text(
+                text, chat_id=chat_id, message_id=edit_message_id,
+                reply_markup=_kb_control(gid, count),
+            )
+            _admin_panels[gid] = (chat_id, ctrl.message_id)
+            return
+        except Exception:
+            pass
+
+    ctrl = await bot.send_message(chat_id, text, reply_markup=_kb_control(gid, count))
+    _admin_panels[gid] = (chat_id, ctrl.message_id)
 
 
 # ── Participation (channel users) ────────────────────────
@@ -474,17 +1347,10 @@ async def on_participate(cb: CallbackQuery) -> None:
     added = db.add_participant(gid, user.id, user.username, name)
 
     if added:
-        cd = db.cooldown_remaining(user.id, _cooldown())
-        if cd:
-            await cb.answer(
-                f"✅ Записал! (кулдаун ещё {cd} мин — не сможешь выиграть)",
-                show_alert=False,
-            )
-        else:
-            await cb.answer("✅ Ты участвуешь!", show_alert=False)
+        await cb.answer("🎲 Вы успешно зарегистрированы в розыгрыше!", show_alert=True)
         _schedule_button_update(gid)
     else:
-        await cb.answer("Ты уже участвуешь!", show_alert=False)
+        await cb.answer("Вы уже участвуете!", show_alert=False)
 
 
 # ── Refresh participant count ────────────────────────────
@@ -536,6 +1402,7 @@ async def _do_draw(gid: int, chat_id: int, message_id: int | None = None) -> Non
         task = _draw_timers.pop(gid)
         if not task.done():
             task.cancel()
+    _draw_deadlines.pop(gid, None)
 
     cd = _cooldown()
     eligible = db.get_eligible(gid, cd)
@@ -586,15 +1453,175 @@ async def on_draw(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
+# ── Manual pick from participant list ────────────────────
+
+@router.callback_query(F.data.startswith("pick:"))
+async def on_pick_list(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    parts = cb.data.split(":")
+    gid, page = int(parts[1]), int(parts[2])
+    g = db.get_giveaway(gid)
+    if not g or g.status != "active":
+        await cb.answer("Розыгрыш не активен")
+        return
+    participants = db.get_participants(gid)
+    if not participants:
+        await cb.answer("Нет участников")
+        return
+
+    page_items, total_pages = _paginate(participants, page)
+    buttons = []
+    for p in page_items:
+        label = f"@{p.username}" if p.username else p.full_name
+        buttons.append([
+            InlineKeyboardButton(text=label, callback_data=f"setwin:{gid}:{p.user_id}"),
+        ])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"pick:{gid}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"pick:{gid}:{page + 1}"))
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"act:{gid}")])
+
+    text = f"👤 Выбери победителя ({len(participants)}):"
+    try:
+        await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    except Exception:
+        await cb.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("setwin:"))
+async def on_set_winner(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    parts = cb.data.split(":")
+    gid, user_id = int(parts[1]), int(parts[2])
+    g = db.get_giveaway(gid)
+    if not g or g.status != "active":
+        await cb.answer("Розыгрыш не активен")
+        return
+
+    participants = db.get_participants(gid)
+    winner = next((p for p in participants if p.user_id == user_id), None)
+    if not winner:
+        await cb.answer("Участник не найден")
+        return
+
+    _pending_winners[gid] = [winner]
+    total = len(participants)
+    has_timer = gid in _draw_timers and not _draw_timers[gid].done()
+    timer_note = "\n⏱ Таймер продолжается — победитель будет объявлен автоматически" if has_timer else ""
+    text = (
+        f"🎁 {g.prize_text[:50]}\n"
+        f"👥 Участников: {total}\n\n"
+        f"👤 Выбран вручную:\n"
+        f"{_format_winners([winner])}"
+        f"{timer_note}"
+    )
+    kb = _kb_winner(gid)
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cb.message.answer(text, reply_markup=kb)
+    await cb.answer(f"✅ {_display(winner)} выбран победителем")
+
+
 async def _timer_draw(gid: int, minutes: int, admin_chat_id: int) -> None:
     try:
         await asyncio.sleep(minutes * 60)
     except asyncio.CancelledError:
         return
     _draw_timers.pop(gid, None)
-    panel = _admin_panels.get(gid)
-    mid = panel[1] if panel else None
-    await _do_draw(gid, admin_chat_id, mid)
+    _draw_deadlines.pop(gid, None)
+    await _auto_finish(gid, admin_chat_id)
+
+
+async def _auto_finish(gid: int, admin_chat_id: int) -> None:
+    g = db.get_giveaway(gid)
+    if not g or g.status != "active":
+        return
+
+    total = db.participant_count(gid)
+    panel = _admin_panels.pop(gid, None)
+
+    pre_selected = _pending_winners.pop(gid, None)
+    if pre_selected:
+        winners = pre_selected
+    else:
+        cd = _cooldown()
+        eligible = db.get_eligible(gid, cd)
+
+        if not eligible:
+            db.finish_giveaway(gid)
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=g.channel_id,
+                    message_id=g.channel_message_id,
+                    reply_markup=_kb_finished(gid, total),
+                )
+            except Exception:
+                pass
+            text = (
+                f"⏱ Таймер розыгрыша #{gid} истёк\n\n"
+                f"🎁 {g.prize_text[:50]}\n"
+                f"👥 Участников: {total}\n"
+                f"❌ Нет подходящих участников"
+            )
+            if total > 0:
+                text += " (все на кулдауне)"
+            if panel:
+                try:
+                    await bot.edit_message_text(text, chat_id=panel[0], message_id=panel[1])
+                except Exception:
+                    await bot.send_message(admin_chat_id, text)
+            else:
+                await bot.send_message(admin_chat_id, text)
+            return
+
+        pick_count = min(g.winner_count, len(eligible))
+        winners = random.sample(eligible, pick_count)
+
+    for w in winners:
+        db.add_winner(gid, w.user_id, w.username, w.full_name)
+    db.finish_giveaway(gid)
+
+    try:
+        announce = f"🎉 Результаты розыгрыша:\n\n{_format_winners(winners)}\n\nПриз: {g.prize_text}"
+        await bot.send_message(chat_id=g.channel_id, text=announce)
+    except Exception:
+        log.exception("Auto-finish: failed to announce in %s", g.channel_id)
+
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=g.channel_id,
+            message_id=g.channel_message_id,
+            reply_markup=_kb_finished(gid, total),
+        )
+    except Exception:
+        pass
+
+    admin_text = (
+        f"⏱ Розыгрыш #{gid} завершён автоматически\n\n"
+        f"🎁 {g.prize_text[:50]}\n"
+        f"👥 Участников: {total} (подходящих: {len(eligible)})\n"
+        f"{_format_winners(winners)}\n"
+        f"⏳ Кулдаун: {cd} мин"
+    )
+    if pick_count < g.winner_count:
+        admin_text += f"\n⚠️ Подходящих меньше чем нужно ({pick_count}/{g.winner_count})"
+
+    if panel:
+        try:
+            await bot.edit_message_text(admin_text, chat_id=panel[0], message_id=panel[1])
+        except Exception:
+            await bot.send_message(admin_chat_id, admin_text)
+    else:
+        await bot.send_message(admin_chat_id, admin_text)
 
 
 # ── Re-roll ──────────────────────────────────────────────
@@ -631,14 +1658,12 @@ async def on_confirm(cb: CallbackQuery) -> None:
 
     total = db.participant_count(gid)
 
-    # Announce in channel
     try:
         announce = f"🎉 Результаты розыгрыша:\n\n{_format_winners(winners)}\n\nПриз: {g.prize_text}"
         await bot.send_message(chat_id=g.channel_id, text=announce)
     except Exception:
         log.exception("Failed to announce winner in %s", g.channel_id)
 
-    # Update channel post button to "Завершён"
     try:
         await bot.edit_message_reply_markup(
             chat_id=g.channel_id,
@@ -649,19 +1674,24 @@ async def on_confirm(cb: CallbackQuery) -> None:
         log.exception("Failed to update channel post button")
 
     cd = _cooldown()
+    nav_buttons = [[InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")]]
+    if g.game_id:
+        nav_buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
+    nav_buttons.append([InlineKeyboardButton(text="🎮 К играм", callback_data="show_games")])
     await cb.message.edit_text(
         f"✅ Розыгрыш #{gid} завершён\n\n"
         f"🎁 {g.prize_text[:50]}\n"
         f"👥 Участников: {total}\n"
         f"{_format_winners(winners)}\n"
-        f"⏳ Кулдаун: {cd} мин"
+        f"⏳ Кулдаун: {cd} мин",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=nav_buttons),
     )
     await cb.answer("Подтверждено!")
 
 
 # ── /finish — force-close active giveaway ────────────────
 
-@router.message(Command("finish"))
+@cmd_router.message(Command("finish"))
 async def cmd_finish(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
@@ -675,6 +1705,7 @@ async def cmd_finish(message: Message) -> None:
         task = _draw_timers.pop(active.id)
         if not task.done():
             task.cancel()
+    _draw_deadlines.pop(active.id, None)
     _pending_winners.pop(active.id, None)
     _admin_panels.pop(active.id, None)
 
@@ -695,7 +1726,7 @@ async def cmd_finish(message: Message) -> None:
 
 # ── /cooldown ────────────────────────────────────────────
 
-@router.message(Command("cooldown"))
+@cmd_router.message(Command("cooldown"))
 async def cmd_cooldown(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
@@ -719,7 +1750,7 @@ async def cmd_cooldown(message: Message) -> None:
 
 # ── /winners ─────────────────────────────────────────────
 
-@router.message(Command("winners"))
+@cmd_router.message(Command("winners"))
 async def cmd_winners(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
@@ -738,7 +1769,7 @@ async def cmd_winners(message: Message) -> None:
 
 # ── /resetcooldowns ──────────────────────────────────────
 
-@router.message(Command("resetcooldowns"))
+@cmd_router.message(Command("resetcooldowns"))
 async def cmd_reset(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
@@ -748,9 +1779,48 @@ async def cmd_reset(message: Message) -> None:
 
 # ── Entry point ──────────────────────────────────────────
 
+async def _restore_timers() -> None:
+    """Restore draw timers for active giveaways with deadlines after bot restart."""
+    active = db.get_all_active()
+    now = datetime.now(timezone.utc)
+    restored = 0
+    auto_finished = 0
+    for g in active:
+        if not g.draw_deadline:
+            continue
+        deadline = datetime.fromisoformat(g.draw_deadline)
+        _draw_deadlines[g.id] = deadline
+        remaining = (deadline - now).total_seconds()
+        admin_chat = g.admin_chat_id or (cfg.admin_ids[0] if cfg.admin_ids else None)
+        if remaining <= 0:
+            log.info("Giveaway #%d deadline passed, auto-finishing", g.id)
+            asyncio.create_task(_auto_finish(g.id, admin_chat))
+            auto_finished += 1
+        else:
+            minutes = remaining / 60
+            log.info("Restoring timer for giveaway #%d (%.1f min left)", g.id, minutes)
+            task = asyncio.create_task(_timer_draw_seconds(g.id, remaining, admin_chat))
+            _draw_timers[g.id] = task
+            restored += 1
+    if restored or auto_finished:
+        log.info("Timers: restored=%d, auto-finished=%d", restored, auto_finished)
+
+
+async def _timer_draw_seconds(gid: int, seconds: float, admin_chat_id: int) -> None:
+    """Like _timer_draw but takes seconds directly (for restoring partial timers)."""
+    try:
+        await asyncio.sleep(seconds)
+    except asyncio.CancelledError:
+        return
+    _draw_timers.pop(gid, None)
+    _draw_deadlines.pop(gid, None)
+    await _auto_finish(gid, admin_chat_id)
+
+
 async def main() -> None:
     db.init_db()
     dp = Dispatcher()
+    dp.include_router(cmd_router)
     dp.include_router(router)
 
     ch_names = ", ".join(ch.label for ch in cfg.channels)
@@ -758,6 +1828,12 @@ async def main() -> None:
         "Bot starting — admins=%s, channels=[%s], cooldown=%d min",
         cfg.admin_ids, ch_names, cfg.default_cooldown_minutes,
     )
+
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Главное меню"),
+    ])
+
+    await _restore_timers()
     await dp.start_polling(bot)
 
 

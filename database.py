@@ -15,8 +15,18 @@ def _conn() -> sqlite3.Connection:
 
 
 @dataclass
+class Game:
+    id: int
+    name: str
+    status: str
+    created_at: str
+
+
+@dataclass
 class Giveaway:
     id: int
+    game_id: int | None
+    name: str | None
     prize_text: str
     prize_entities: str | None
     photo_id: str | None
@@ -25,6 +35,8 @@ class Giveaway:
     created_at: str
     channel_message_id: int | None
     channel_id: str | None
+    draw_deadline: str | None
+    admin_chat_id: int | None
 
 
 @dataclass
@@ -35,8 +47,8 @@ class Participant:
 
 
 _GIVEAWAY_COLS = (
-    "id, prize_text, prize_entities, photo_id, winner_count, "
-    "status, created_at, channel_message_id, channel_id"
+    "id, game_id, name, prize_text, prize_entities, photo_id, winner_count, "
+    "status, created_at, channel_message_id, channel_id, draw_deadline, admin_chat_id"
 )
 
 
@@ -44,8 +56,16 @@ def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = _conn()
     conn.executescript("""
+        CREATE TABLE IF NOT EXISTS games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            status TEXT DEFAULT 'active',
+            created_at TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS giveaways (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id INTEGER,
             prize_text TEXT NOT NULL,
             prize_entities TEXT,
             photo_id TEXT,
@@ -85,6 +105,16 @@ def init_db() -> None:
             value TEXT NOT NULL
         );
     """)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(giveaways)").fetchall()}
+    if "game_id" not in cols:
+        conn.execute("ALTER TABLE giveaways ADD COLUMN game_id INTEGER")
+    if "draw_deadline" not in cols:
+        conn.execute("ALTER TABLE giveaways ADD COLUMN draw_deadline TEXT")
+    if "admin_chat_id" not in cols:
+        conn.execute("ALTER TABLE giveaways ADD COLUMN admin_chat_id INTEGER")
+    if "name" not in cols:
+        conn.execute("ALTER TABLE giveaways ADD COLUMN name TEXT")
+    conn.commit()
     conn.close()
 
 
@@ -104,19 +134,13 @@ def set_setting(key: str, value: str) -> None:
     conn.close()
 
 
-# ── Giveaways ────────────────────────────────────────────
+# ── Games ─────────────────────────────────────────────────
 
-def add_giveaway(
-    prize_text: str,
-    prize_entities: str | None = None,
-    photo_id: str | None = None,
-    winner_count: int = 1,
-) -> int:
+def add_game(name: str) -> int:
     conn = _conn()
     cur = conn.execute(
-        "INSERT INTO giveaways (prize_text, prize_entities, photo_id, winner_count, created_at) "
-        "VALUES (?,?,?,?,?)",
-        (prize_text, prize_entities, photo_id, winner_count, _now()),
+        "INSERT INTO games (name, created_at) VALUES (?,?)",
+        (name, _now()),
     )
     gid = cur.lastrowid
     conn.commit()
@@ -124,13 +148,114 @@ def add_giveaway(
     return gid
 
 
-def get_queued() -> list[Giveaway]:
+def get_games() -> list[Game]:
     conn = _conn()
     rows = conn.execute(
-        f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE status='queued' ORDER BY id"
+        "SELECT id, name, status, created_at FROM games WHERE status='active' ORDER BY id DESC"
+    ).fetchall()
+    conn.close()
+    return [Game(*r) for r in rows]
+
+
+def get_game(game_id: int) -> Game | None:
+    conn = _conn()
+    row = conn.execute(
+        "SELECT id, name, status, created_at FROM games WHERE id=?", (game_id,)
+    ).fetchone()
+    conn.close()
+    return Game(*row) if row else None
+
+
+def delete_game(game_id: int) -> bool:
+    conn = _conn()
+    conn.execute("UPDATE giveaways SET game_id=NULL WHERE game_id=?", (game_id,))
+    cur = conn.execute("DELETE FROM games WHERE id=?", (game_id,))
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def game_giveaway_count(game_id: int) -> tuple[int, int, int]:
+    """Returns (queued, active, finished) counts for a game."""
+    conn = _conn()
+    queued = conn.execute(
+        "SELECT COUNT(*) FROM giveaways WHERE game_id=? AND status='queued'", (game_id,)
+    ).fetchone()[0]
+    active = conn.execute(
+        "SELECT COUNT(*) FROM giveaways WHERE game_id=? AND status='active'", (game_id,)
+    ).fetchone()[0]
+    finished = conn.execute(
+        "SELECT COUNT(*) FROM giveaways WHERE game_id=? AND status='finished'", (game_id,)
+    ).fetchone()[0]
+    conn.close()
+    return queued, active, finished
+
+
+# ── Giveaways ────────────────────────────────────────────
+
+def add_giveaway(
+    prize_text: str,
+    prize_entities: str | None = None,
+    photo_id: str | None = None,
+    winner_count: int = 1,
+    game_id: int | None = None,
+    name: str | None = None,
+) -> int:
+    conn = _conn()
+    cur = conn.execute(
+        "INSERT INTO giveaways (game_id, name, prize_text, prize_entities, photo_id, winner_count, created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (game_id, name, prize_text, prize_entities, photo_id, winner_count, _now()),
+    )
+    gid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return gid
+
+
+def get_queued(game_id: int | None = None) -> list[Giveaway]:
+    conn = _conn()
+    if game_id is not None:
+        rows = conn.execute(
+            f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE status='queued' AND game_id=? ORDER BY id",
+            (game_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE status='queued' ORDER BY id"
+        ).fetchall()
+    conn.close()
+    return [Giveaway(*r) for r in rows]
+
+
+def get_free_giveaways() -> list[Giveaway]:
+    """Giveaways not assigned to any game (reusable library)."""
+    conn = _conn()
+    rows = conn.execute(
+        f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE game_id IS NULL AND status IN ('queued','finished') ORDER BY id"
     ).fetchall()
     conn.close()
     return [Giveaway(*r) for r in rows]
+
+
+def assign_to_game(gid: int, game_id: int) -> bool:
+    conn = _conn()
+    conn.execute("UPDATE giveaways SET game_id=?, status='queued' WHERE id=?", (game_id, gid))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def reset_giveaway(gid: int) -> bool:
+    """Reset a finished giveaway back to queued for reuse."""
+    conn = _conn()
+    cur = conn.execute(
+        "UPDATE giveaways SET status='queued', channel_id=NULL, channel_message_id=NULL WHERE id=?",
+        (gid,),
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
 
 
 def get_giveaway(gid: int) -> Giveaway | None:
@@ -151,11 +276,24 @@ def get_active() -> Giveaway | None:
     return Giveaway(*row) if row else None
 
 
-def activate_giveaway(gid: int, channel_id: str, message_id: int) -> None:
+def get_all_active() -> list[Giveaway]:
+    conn = _conn()
+    rows = conn.execute(
+        f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE status='active' ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [Giveaway(*r) for r in rows]
+
+
+def activate_giveaway(
+    gid: int, channel_id: str, message_id: int,
+    draw_deadline: str | None = None, admin_chat_id: int | None = None,
+) -> None:
     conn = _conn()
     conn.execute(
-        "UPDATE giveaways SET status='active', channel_id=?, channel_message_id=? WHERE id=?",
-        (channel_id, message_id, gid),
+        "UPDATE giveaways SET status='active', channel_id=?, channel_message_id=?, "
+        "draw_deadline=?, admin_chat_id=? WHERE id=?",
+        (channel_id, message_id, draw_deadline, admin_chat_id, gid),
     )
     conn.commit()
     conn.close()
@@ -163,15 +301,54 @@ def activate_giveaway(gid: int, channel_id: str, message_id: int) -> None:
 
 def finish_giveaway(gid: int) -> None:
     conn = _conn()
-    conn.execute("UPDATE giveaways SET status='finished' WHERE id=?", (gid,))
+    conn.execute(
+        "UPDATE giveaways SET status='finished', draw_deadline=NULL WHERE id=?", (gid,)
+    )
     conn.execute("DELETE FROM draw_rejects WHERE giveaway_id=?", (gid,))
     conn.commit()
     conn.close()
 
 
+def update_giveaway(
+    gid: int,
+    prize_text: str | None = None,
+    prize_entities: str | None = None,
+    photo_id: str | None = None,
+    clear_photo: bool = False,
+    name: str | None = None,
+) -> bool:
+    conn = _conn()
+    fields: list[str] = []
+    values: list = []
+    if name is not None:
+        fields.append("name=?")
+        values.append(name)
+    if prize_text is not None:
+        fields.append("prize_text=?")
+        values.append(prize_text)
+        fields.append("prize_entities=?")
+        values.append(prize_entities)
+    if clear_photo:
+        fields.append("photo_id=NULL")
+    elif photo_id is not None:
+        fields.append("photo_id=?")
+        values.append(photo_id)
+    if not fields:
+        conn.close()
+        return False
+    values.append(gid)
+    cur = conn.execute(
+        f"UPDATE giveaways SET {', '.join(fields)} WHERE id=? AND status IN ('queued','finished')",
+        values,
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
 def delete_giveaway(gid: int) -> bool:
     conn = _conn()
-    cur = conn.execute("DELETE FROM giveaways WHERE id=? AND status='queued'", (gid,))
+    cur = conn.execute("DELETE FROM giveaways WHERE id=? AND status IN ('queued','finished')", (gid,))
     conn.commit()
     conn.close()
     return cur.rowcount > 0
@@ -227,6 +404,16 @@ def get_eligible(gid: int, cooldown_minutes: int) -> list[Participant]:
     conn.close()
 
     return [Participant(*r) for r in rows if r[0] not in excluded]
+
+
+def get_participants(gid: int) -> list[Participant]:
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT user_id, username, full_name FROM participants WHERE giveaway_id=?",
+        (gid,),
+    ).fetchall()
+    conn.close()
+    return [Participant(*r) for r in rows]
 
 
 # ── Winners / Rejects ────────────────────────────────────
