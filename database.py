@@ -20,6 +20,7 @@ class Game:
     name: str
     status: str
     created_at: str
+    country: str | None
 
 
 @dataclass
@@ -37,6 +38,7 @@ class Giveaway:
     channel_id: str | None
     draw_deadline: str | None
     admin_chat_id: int | None
+    country: str | None
 
 
 @dataclass
@@ -48,7 +50,7 @@ class Participant:
 
 _GIVEAWAY_COLS = (
     "id, game_id, name, prize_text, prize_entities, photo_id, winner_count, "
-    "status, created_at, channel_message_id, channel_id, draw_deadline, admin_chat_id"
+    "status, created_at, channel_message_id, channel_id, draw_deadline, admin_chat_id, country"
 )
 
 
@@ -114,6 +116,15 @@ def init_db() -> None:
         conn.execute("ALTER TABLE giveaways ADD COLUMN admin_chat_id INTEGER")
     if "name" not in cols:
         conn.execute("ALTER TABLE giveaways ADD COLUMN name TEXT")
+    if "country" not in cols:
+        conn.execute("ALTER TABLE giveaways ADD COLUMN country TEXT")
+
+    game_cols = {r[1] for r in conn.execute("PRAGMA table_info(games)").fetchall()}
+    if "country" not in game_cols:
+        conn.execute("ALTER TABLE games ADD COLUMN country TEXT")
+
+    conn.execute("UPDATE games SET country='mne' WHERE country='me'")
+    conn.execute("UPDATE giveaways SET country='mne' WHERE country='me'")
     conn.commit()
     conn.close()
 
@@ -136,11 +147,11 @@ def set_setting(key: str, value: str) -> None:
 
 # ── Games ─────────────────────────────────────────────────
 
-def add_game(name: str) -> int:
+def add_game(name: str, country: str | None = None) -> int:
     conn = _conn()
     cur = conn.execute(
-        "INSERT INTO games (name, created_at) VALUES (?,?)",
-        (name, _now()),
+        "INSERT INTO games (name, created_at, country) VALUES (?,?,?)",
+        (name, _now(), country),
     )
     gid = cur.lastrowid
     conn.commit()
@@ -148,11 +159,17 @@ def add_game(name: str) -> int:
     return gid
 
 
-def get_games() -> list[Game]:
+def get_games(country: str | None = None) -> list[Game]:
     conn = _conn()
-    rows = conn.execute(
-        "SELECT id, name, status, created_at FROM games WHERE status='active' ORDER BY id DESC"
-    ).fetchall()
+    if country:
+        rows = conn.execute(
+            "SELECT id, name, status, created_at, country FROM games WHERE status='active' AND country=? ORDER BY id DESC",
+            (country,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, name, status, created_at, country FROM games WHERE status='active' ORDER BY id DESC"
+        ).fetchall()
     conn.close()
     return [Game(*r) for r in rows]
 
@@ -160,7 +177,7 @@ def get_games() -> list[Game]:
 def get_game(game_id: int) -> Game | None:
     conn = _conn()
     row = conn.execute(
-        "SELECT id, name, status, created_at FROM games WHERE id=?", (game_id,)
+        "SELECT id, name, status, created_at, country FROM games WHERE id=?", (game_id,)
     ).fetchone()
     conn.close()
     return Game(*row) if row else None
@@ -200,12 +217,13 @@ def add_giveaway(
     winner_count: int = 1,
     game_id: int | None = None,
     name: str | None = None,
+    country: str | None = None,
 ) -> int:
     conn = _conn()
     cur = conn.execute(
-        "INSERT INTO giveaways (game_id, name, prize_text, prize_entities, photo_id, winner_count, created_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (game_id, name, prize_text, prize_entities, photo_id, winner_count, _now()),
+        "INSERT INTO giveaways (game_id, name, prize_text, prize_entities, photo_id, winner_count, created_at, country) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (game_id, name, prize_text, prize_entities, photo_id, winner_count, _now(), country),
     )
     gid = cur.lastrowid
     conn.commit()
@@ -228,12 +246,18 @@ def get_queued(game_id: int | None = None) -> list[Giveaway]:
     return [Giveaway(*r) for r in rows]
 
 
-def get_free_giveaways() -> list[Giveaway]:
+def get_free_giveaways(country: str | None = None) -> list[Giveaway]:
     """Giveaways not assigned to any game (reusable library)."""
     conn = _conn()
-    rows = conn.execute(
-        f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE game_id IS NULL AND status IN ('queued','finished') ORDER BY id"
-    ).fetchall()
+    if country:
+        rows = conn.execute(
+            f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE game_id IS NULL AND status IN ('queued','finished') AND country=? ORDER BY id",
+            (country,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE game_id IS NULL AND status IN ('queued','finished') ORDER BY id"
+        ).fetchall()
     conn.close()
     return [Giveaway(*r) for r in rows]
 

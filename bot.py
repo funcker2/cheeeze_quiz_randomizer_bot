@@ -33,6 +33,7 @@ _draw_deadlines: dict[int, datetime] = {}
 _pending_winners: dict[int, list[db.Participant]] = {}
 _admin_panels: dict[int, tuple[int, int]] = {}
 _button_update_tasks: dict[int, asyncio.Task] = {}
+_user_country: dict[int, str] = {}
 
 
 class NewGame(StatesGroup):
@@ -56,7 +57,23 @@ class PublishGiveaway(StatesGroup):
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in cfg.admin_ids
+    return cfg.is_admin(user_id)
+
+
+def _get_country(user_id: int) -> str | None:
+    return _user_country.get(user_id)
+
+
+def _country_channels(country_code: str):
+    c = cfg.country_by_code(country_code)
+    return c.channels if c else ()
+
+
+def _channel_by_country_idx(country_code: str, idx: int):
+    channels = _country_channels(country_code)
+    if 0 <= idx < len(channels):
+        return channels[idx]
+    return None
 
 
 def _cooldown() -> int:
@@ -239,17 +256,78 @@ async def _do_button_update(gid: int) -> None:
 async def cmd_start(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
+    countries = cfg.admin_countries(message.from_user.id)
+    if len(countries) == 1:
+        _user_country[message.from_user.id] = countries[0].code
+        await _show_main_menu(message.chat.id)
+    else:
+        await _show_country_picker(message.chat.id)
+
+
+async def _show_country_picker(chat_id: int, message_id: int | None = None) -> None:
+    buttons = [
+        [InlineKeyboardButton(text=c.label, callback_data=f"country:{c.code}")]
+        for c in cfg.countries
+    ]
+    text = "🌍 Выбери страну:"
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if message_id:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("country:"))
+async def on_country_select(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    code = cb.data.split(":")[1]
+    country = cfg.country_by_code(code)
+    if not country:
+        await cb.answer("Неизвестная страна")
+        return
+    if cb.from_user.id not in country.admin_ids:
+        await cb.answer("Нет доступа к этой стране")
+        return
+    _user_country[cb.from_user.id] = code
+    await _show_main_menu(cb.message.chat.id, cb.message.message_id)
+    await cb.answer(f"{country.label}")
+
+
+async def _show_main_menu(chat_id: int, message_id: int | None = None) -> None:
+    uid = chat_id
+    country_code = _get_country(uid)
+    country = cfg.country_by_code(country_code) if country_code else None
+    country_label = country.label if country else "?"
     cd = _cooldown()
-    await message.answer(
-        "🎲 Бот-рандомайзер для розыгрышей",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎮 Мои игры", callback_data="show_games")],
-            [InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")],
-            [InlineKeyboardButton(text=f"⏳ Кулдаун: {cd} мин", callback_data="show_cooldown")],
-            [InlineKeyboardButton(text="🏆 Победители на кулдауне", callback_data="show_winners")],
-            [InlineKeyboardButton(text="🔄 Сброс кулдауна", callback_data="reset_cooldowns")],
-        ]),
-    )
+    buttons = [
+        [InlineKeyboardButton(text="🎮 Мои игры", callback_data="show_games")],
+        [InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")],
+        [InlineKeyboardButton(text=f"⏳ Кулдаун: {cd} мин", callback_data="show_cooldown")],
+        [InlineKeyboardButton(text="🏆 Победители на кулдауне", callback_data="show_winners")],
+        [InlineKeyboardButton(text="🔄 Сброс кулдауна", callback_data="reset_cooldowns")],
+        [InlineKeyboardButton(text=f"🌍 {country_label}", callback_data="switch_country")],
+    ]
+    text = f"🎲 Бот-рандомайзер — {country_label}"
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if message_id:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "switch_country")
+async def on_switch_country(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    await _show_country_picker(cb.message.chat.id, cb.message.message_id)
+    await cb.answer()
 
 
 # ── Game management ──────────────────────────────────────
@@ -258,10 +336,14 @@ async def cmd_start(message: Message) -> None:
 async def cmd_newgame(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
+    country = _get_country(message.from_user.id)
+    if not country:
+        await message.answer("Сначала выбери страну: /start")
+        return
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) > 1 and parts[1].strip():
         name = parts[1].strip()
-        gid = db.add_game(name)
+        gid = db.add_game(name, country=country)
         await message.answer(
             f"🎮 Игра «{name}» создана!\n\nДобавляй розыгрыши:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -283,7 +365,8 @@ async def on_game_name(message: Message, state: FSMContext) -> None:
     if not name:
         await message.answer("Название не может быть пустым.")
         return
-    gid = db.add_game(name)
+    country = _get_country(message.from_user.id)
+    gid = db.add_game(name, country=country)
     await state.clear()
     await message.answer(
         f"🎮 Игра «{name}» создана!\n\nДобавляй розыгрыши:",
@@ -302,7 +385,8 @@ async def cmd_games(message: Message) -> None:
 
 
 async def _show_games(chat_id: int, message_id: int | None = None) -> None:
-    games = db.get_games()
+    country = _get_country(chat_id)
+    games = db.get_games(country=country)
     if not games:
         text = "🎮 Нет игр."
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -449,7 +533,8 @@ async def on_delete_game(cb: CallbackQuery) -> None:
 # ── Library (free giveaways) ────────────────────────────
 
 async def _show_library(chat_id: int, message_id: int | None = None, page: int = 0) -> None:
-    free = db.get_free_giveaways()
+    country = _get_country(chat_id)
+    free = db.get_free_giveaways(country=country)
     if not free:
         text = "📚 Библиотека пуста."
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -554,7 +639,8 @@ async def on_game_library(cb: CallbackQuery) -> None:
     if not is_admin(cb.from_user.id):
         return
     game_id = int(cb.data.split(":")[1])
-    free = db.get_free_giveaways()
+    country = _get_country(cb.from_user.id)
+    free = db.get_free_giveaways(country=country)
     if not free:
         await cb.answer("Библиотека пуста — все розыгрыши привязаны к играм")
         return
@@ -635,7 +721,8 @@ async def on_game_add(cb: CallbackQuery, state: FSMContext) -> None:
 async def cmd_new(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
-    games = db.get_games()
+    country = _get_country(message.from_user.id)
+    games = db.get_games(country=country)
     if not games:
         await message.answer("Сначала создай игру: /newgame")
         return
@@ -734,12 +821,18 @@ async def on_text_for_photo_invalid(message: Message) -> None:
 async def _save_giveaway(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     game_id = data.get("game_id")
+    country = _get_country(message.from_user.id)
+    if game_id:
+        game_obj = db.get_game(game_id)
+        if game_obj and game_obj.country:
+            country = game_obj.country
     gid = db.add_giveaway(
         prize_text=data["prize_text"],
         prize_entities=data.get("prize_entities"),
         photo_id=data.get("photo_id"),
         game_id=game_id,
         name=data.get("giveaway_name"),
+        country=country,
     )
     await state.clear()
 
@@ -753,7 +846,7 @@ async def _save_giveaway(message: Message, state: FSMContext) -> None:
         count_label = f"📋 В очереди: {len(queue)}"
         buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{game_id}")])
     else:
-        free = db.get_free_giveaways()
+        free = db.get_free_giveaways(country=country)
         count_label = f"📚 В библиотеке: {len(free)}"
         buttons.append([InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")])
 
@@ -801,20 +894,7 @@ async def on_new_lib(cb: CallbackQuery, state: FSMContext) -> None:
 async def on_go_menu(cb: CallbackQuery) -> None:
     if not is_admin(cb.from_user.id):
         return
-    cd = _cooldown()
-    try:
-        await cb.message.edit_text(
-            "🎲 Бот-рандомайзер для розыгрышей",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🎮 Мои игры", callback_data="show_games")],
-                [InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")],
-                [InlineKeyboardButton(text=f"⏳ Кулдаун: {cd} мин", callback_data="show_cooldown")],
-                [InlineKeyboardButton(text="🏆 Победители на кулдауне", callback_data="show_winners")],
-                [InlineKeyboardButton(text="🔄 Сброс кулдауна", callback_data="reset_cooldowns")],
-            ]),
-        )
-    except Exception:
-        pass
+    await _show_main_menu(cb.message.chat.id, cb.message.message_id)
     await cb.answer()
 
 
@@ -916,13 +996,15 @@ async def on_view_giveaway(cb: CallbackQuery) -> None:
         )
 
     top_buttons: list[list[InlineKeyboardButton]] = []
+    country_code = g.country or _get_country(cb.from_user.id)
     if g.game_id:
+        channels = _country_channels(country_code) if country_code else ()
         top_buttons = [
             [InlineKeyboardButton(text=f"📢 {ch.label}", callback_data=f"ch:{i}:{gid}")]
-            for i, ch in enumerate(cfg.channels)
+            for i, ch in enumerate(channels)
         ]
     else:
-        games = db.get_games()
+        games = db.get_games(country=country_code)
         if games:
             for gm in games:
                 top_buttons.append([
@@ -1126,7 +1208,8 @@ async def on_active_detail(cb: CallbackQuery) -> None:
     eligible = len(db.get_eligible(gid, _cooldown()))
     timer_info = _remaining_time(gid)
     channel_label = g.channel_id
-    for ch in cfg.channels:
+    country_code = g.country or _get_country(cb.from_user.id)
+    for ch in _country_channels(country_code) if country_code else ():
         if ch.id == g.channel_id:
             channel_label = ch.label
             break
@@ -1273,7 +1356,11 @@ async def _publish_giveaway(
         await bot.send_message(chat_id, "Розыгрыш недоступен.")
         return
 
-    channel = cfg.channels[ch_idx]
+    country_code = g.country or _get_country(chat_id)
+    channel = _channel_by_country_idx(country_code, ch_idx) if country_code else None
+    if not channel:
+        await bot.send_message(chat_id, "Канал не найден для этой страны.")
+        return
     entities = _deserialize_entities(g.prize_entities)
 
     if g.photo_id:
@@ -1546,15 +1633,18 @@ async def _auto_finish(gid: int, admin_chat_id: int) -> None:
     if not g or g.status != "active":
         return
 
+    cd = _cooldown()
     total = db.participant_count(gid)
     panel = _admin_panels.pop(gid, None)
 
     pre_selected = _pending_winners.pop(gid, None)
     if pre_selected:
         winners = pre_selected
+        eligible_count = total
+        pick_count = len(winners)
     else:
-        cd = _cooldown()
         eligible = db.get_eligible(gid, cd)
+        eligible_count = len(eligible)
 
         if not eligible:
             db.finish_giveaway(gid)
@@ -1608,7 +1698,7 @@ async def _auto_finish(gid: int, admin_chat_id: int) -> None:
     admin_text = (
         f"⏱ Розыгрыш #{gid} завершён автоматически\n\n"
         f"🎁 {g.prize_text[:50]}\n"
-        f"👥 Участников: {total} (подходящих: {len(eligible)})\n"
+        f"👥 Участников: {total} (подходящих: {eligible_count})\n"
         f"{_format_winners(winners)}\n"
         f"⏳ Кулдаун: {cd} мин"
     )
@@ -1791,7 +1881,8 @@ async def _restore_timers() -> None:
         deadline = datetime.fromisoformat(g.draw_deadline)
         _draw_deadlines[g.id] = deadline
         remaining = (deadline - now).total_seconds()
-        admin_chat = g.admin_chat_id or (cfg.admin_ids[0] if cfg.admin_ids else None)
+        fallback_admin = next(iter(cfg.all_admin_ids), None)
+        admin_chat = g.admin_chat_id or fallback_admin
         if remaining <= 0:
             log.info("Giveaway #%d deadline passed, auto-finishing", g.id)
             asyncio.create_task(_auto_finish(g.id, admin_chat))
@@ -1823,11 +1914,13 @@ async def main() -> None:
     dp.include_router(cmd_router)
     dp.include_router(router)
 
-    ch_names = ", ".join(ch.label for ch in cfg.channels)
-    log.info(
-        "Bot starting — admins=%s, channels=[%s], cooldown=%d min",
-        cfg.admin_ids, ch_names, cfg.default_cooldown_minutes,
-    )
+    for c in cfg.countries:
+        ch_names = ", ".join(ch.label for ch in c.channels)
+        log.info(
+            "Country %s (%s) — admins=%s, channels=[%s]",
+            c.code, c.label, c.admin_ids, ch_names,
+        )
+    log.info("Bot starting — cooldown=%d min", cfg.default_cooldown_minutes)
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
