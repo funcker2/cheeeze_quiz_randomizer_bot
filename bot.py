@@ -61,7 +61,12 @@ def is_admin(user_id: int) -> bool:
 
 
 def _get_country(user_id: int) -> str | None:
-    return _user_country.get(user_id)
+    if user_id in _user_country:
+        return _user_country[user_id]
+    saved = db.get_setting(f"user_country:{user_id}")
+    if saved:
+        _user_country[user_id] = saved
+    return saved
 
 
 def _country_channels(country_code: str):
@@ -282,6 +287,7 @@ async def cmd_start(message: Message) -> None:
     countries = cfg.admin_countries(message.from_user.id)
     if len(countries) == 1:
         _user_country[message.from_user.id] = countries[0].code
+        db.set_setting(f"user_country:{message.from_user.id}", countries[0].code)
         await _show_main_menu(message.chat.id, user_id=message.from_user.id)
     else:
         await _show_country_picker(message.chat.id)
@@ -316,6 +322,7 @@ async def on_country_select(cb: CallbackQuery) -> None:
         await cb.answer("Нет доступа к этой стране")
         return
     _user_country[cb.from_user.id] = code
+    db.set_setting(f"user_country:{cb.from_user.id}", code)
     await _show_main_menu(cb.message.chat.id, cb.message.message_id, user_id=cb.from_user.id)
     await cb.answer(f"{country.label}")
 
