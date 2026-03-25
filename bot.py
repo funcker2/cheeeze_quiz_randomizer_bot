@@ -282,7 +282,7 @@ async def cmd_start(message: Message) -> None:
     countries = cfg.admin_countries(message.from_user.id)
     if len(countries) == 1:
         _user_country[message.from_user.id] = countries[0].code
-        await _show_main_menu(message.chat.id)
+        await _show_main_menu(message.chat.id, user_id=message.from_user.id)
     else:
         await _show_country_picker(message.chat.id)
 
@@ -316,12 +316,12 @@ async def on_country_select(cb: CallbackQuery) -> None:
         await cb.answer("Нет доступа к этой стране")
         return
     _user_country[cb.from_user.id] = code
-    await _show_main_menu(cb.message.chat.id, cb.message.message_id)
+    await _show_main_menu(cb.message.chat.id, cb.message.message_id, user_id=cb.from_user.id)
     await cb.answer(f"{country.label}")
 
 
-async def _show_main_menu(chat_id: int, message_id: int | None = None) -> None:
-    uid = chat_id
+async def _show_main_menu(chat_id: int, message_id: int | None = None, user_id: int | None = None) -> None:
+    uid = user_id if user_id is not None else chat_id
     country_code = _get_country(uid)
     country = cfg.country_by_code(country_code) if country_code else None
     country_label = country.label if country else "?"
@@ -404,11 +404,11 @@ async def on_game_name(message: Message, state: FSMContext) -> None:
 async def cmd_games(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
-    await _show_games(message.chat.id)
+    await _show_games(message.chat.id, user_id=message.from_user.id)
 
 
-async def _show_games(chat_id: int, message_id: int | None = None) -> None:
-    country = _get_country(chat_id)
+async def _show_games(chat_id: int, message_id: int | None = None, user_id: int | None = None) -> None:
+    country = _get_country(user_id if user_id is not None else chat_id)
     games = db.get_games(country=country)
     if not games:
         text = "🎮 Нет игр."
@@ -459,7 +459,7 @@ async def _show_games(chat_id: int, message_id: int | None = None) -> None:
 async def on_show_games(cb: CallbackQuery) -> None:
     if not is_admin(cb.from_user.id):
         return
-    await _show_games(cb.message.chat.id, cb.message.message_id)
+    await _show_games(cb.message.chat.id, cb.message.message_id, user_id=cb.from_user.id)
     await cb.answer()
 
 
@@ -549,14 +549,14 @@ async def on_delete_game(cb: CallbackQuery) -> None:
         await cb.answer("Не найдена")
         return
     db.delete_game(game_id)
-    await _show_games(cb.message.chat.id, cb.message.message_id)
+    await _show_games(cb.message.chat.id, cb.message.message_id, user_id=cb.from_user.id)
     await cb.answer(f"Игра «{game.name}» удалена")
 
 
 # ── Library (free giveaways) ────────────────────────────
 
-async def _show_library(chat_id: int, message_id: int | None = None, page: int = 0) -> None:
-    country = _get_country(chat_id)
+async def _show_library(chat_id: int, message_id: int | None = None, page: int = 0, user_id: int | None = None) -> None:
+    country = _get_country(user_id if user_id is not None else chat_id)
     free = db.get_free_giveaways(country=country)
     if not free:
         text = "📚 Библиотека пуста."
@@ -610,7 +610,7 @@ async def _show_library(chat_id: int, message_id: int | None = None, page: int =
 async def on_show_library(cb: CallbackQuery) -> None:
     if not is_admin(cb.from_user.id):
         return
-    await _show_library(cb.message.chat.id, cb.message.message_id)
+    await _show_library(cb.message.chat.id, cb.message.message_id, user_id=cb.from_user.id)
     await cb.answer()
 
 
@@ -619,7 +619,7 @@ async def on_lib_page(cb: CallbackQuery) -> None:
     if not is_admin(cb.from_user.id):
         return
     page = int(cb.data.split(":")[1])
-    await _show_library(cb.message.chat.id, cb.message.message_id, page)
+    await _show_library(cb.message.chat.id, cb.message.message_id, page, user_id=cb.from_user.id)
     await cb.answer()
 
 
@@ -917,7 +917,7 @@ async def on_new_lib(cb: CallbackQuery, state: FSMContext) -> None:
 async def on_go_menu(cb: CallbackQuery) -> None:
     if not is_admin(cb.from_user.id):
         return
-    await _show_main_menu(cb.message.chat.id, cb.message.message_id)
+    await _show_main_menu(cb.message.chat.id, cb.message.message_id, user_id=cb.from_user.id)
     await cb.answer()
 
 
@@ -1211,7 +1211,7 @@ async def on_delete(cb: CallbackQuery) -> None:
                 await _show_game(cb.message.chat.id, game, cb.message.message_id)
                 await cb.answer(f"#{gid} удалён")
                 return
-        await _show_library(cb.message.chat.id, cb.message.message_id)
+        await _show_library(cb.message.chat.id, cb.message.message_id, user_id=cb.from_user.id)
         await cb.answer(f"#{gid} удалён")
     else:
         await cb.answer("Не удалось удалить")
