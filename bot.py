@@ -1043,19 +1043,17 @@ async def on_finished_giveaway(cb: CallbackQuery) -> None:
         return
     winners = db.get_giveaway_winners(gid)
     total = db.participant_count(gid)
-    cd = _cooldown(g.country)
-    eligible = db.get_eligible(gid, cd)
     winners_text = _format_winners(winners) if winners else "🏆 Победителей нет"
     text = (
         f"🔴 Розыгрыш #{gid}: {_giveaway_label(g)}\n"
         f"🎁 {g.prize_text[:80]}\n"
-        f"👥 Участников: {total} (подходящих для перевыбора: {len(eligible)})\n\n"
+        f"👥 Участников: {total}\n\n"
         f"{winners_text}"
     )
-    buttons = []
-    if eligible:
-        buttons.append([InlineKeyboardButton(text="🔄 Перевыбрать из возможных", callback_data=f"post_rr:{gid}")])
-    buttons.append([InlineKeyboardButton(text="👤 Назначить из списка", callback_data=f"assign_list:{gid}")])
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Перевыбрать из возможных", callback_data=f"post_rr:{gid}")],
+        [InlineKeyboardButton(text="👤 Назначить из списка", callback_data=f"assign_list:{gid}")],
+    ]
     if g.game_id:
         buttons.append([InlineKeyboardButton(text="◀️ К завершённым", callback_data=f"show_fin:{g.game_id}")])
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
