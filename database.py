@@ -185,6 +185,17 @@ def get_game(game_id: int) -> Game | None:
 
 def delete_game(game_id: int) -> bool:
     conn = _conn()
+    # Clear participants and rejects for finished giveaways returning to library
+    conn.execute(
+        "DELETE FROM participants WHERE giveaway_id IN "
+        "(SELECT id FROM giveaways WHERE game_id=? AND status='finished')",
+        (game_id,),
+    )
+    conn.execute(
+        "DELETE FROM draw_rejects WHERE giveaway_id IN "
+        "(SELECT id FROM giveaways WHERE game_id=? AND status='finished')",
+        (game_id,),
+    )
     conn.execute("UPDATE giveaways SET game_id=NULL WHERE game_id=?", (game_id,))
     cur = conn.execute("DELETE FROM games WHERE id=?", (game_id,))
     conn.commit()
@@ -273,6 +284,8 @@ def assign_to_game(gid: int, game_id: int) -> bool:
 def reset_giveaway(gid: int) -> bool:
     """Reset a finished giveaway back to queued for reuse."""
     conn = _conn()
+    conn.execute("DELETE FROM participants WHERE giveaway_id=?", (gid,))
+    conn.execute("DELETE FROM draw_rejects WHERE giveaway_id=?", (gid,))
     cur = conn.execute(
         "UPDATE giveaways SET status='queued', channel_id=NULL, channel_message_id=NULL WHERE id=?",
         (gid,),
