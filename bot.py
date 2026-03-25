@@ -1110,6 +1110,14 @@ async def on_assign_pick(cb: CallbackQuery) -> None:
         await cb.answer("Не найден")
         return
     db.add_winner(gid, p.user_id, p.username, p.full_name)
+
+    if g.channel_id:
+        try:
+            announce = f"🔄 Новый победитель розыгрыша:\n\n{_format_winners([p])}\n\nПриз: {g.prize_text}"
+            await bot.send_message(chat_id=g.channel_id, text=announce)
+        except Exception:
+            log.exception("assignpick: failed to announce in %s", g.channel_id)
+
     buttons = [
         [InlineKeyboardButton(text="🔄 Перевыбрать из возможных", callback_data=f"post_rr:{gid}")],
         [InlineKeyboardButton(text="👤 Назначить из списка", callback_data=f"assign_list:{gid}")],
