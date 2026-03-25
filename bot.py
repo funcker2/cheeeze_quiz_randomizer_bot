@@ -1113,7 +1113,7 @@ async def on_assign_pick(cb: CallbackQuery) -> None:
 
     if g.channel_id:
         try:
-            announce = f"🔄 Новый победитель розыгрыша:\n\n{_format_winners([p])}\n\nПриз: {g.prize_text}"
+            announce = f"🎉 Результаты розыгрыша:\n\n{_format_winners([p])}\n\nПриз: {g.prize_text}"
             await bot.send_message(chat_id=g.channel_id, text=announce)
         except Exception:
             log.exception("assignpick: failed to announce in %s", g.channel_id)
@@ -2013,7 +2013,7 @@ async def on_post_confirm(cb: CallbackQuery) -> None:
 
     if g.channel_id:
         try:
-            announce = f"🔄 Новый победитель розыгрыша:\n\n{_format_winners(winners)}\n\nПриз: {g.prize_text}"
+            announce = f"🎉 Результаты розыгрыша:\n\n{_format_winners(winners)}\n\nПриз: {g.prize_text}"
             await bot.send_message(chat_id=g.channel_id, text=announce)
         except Exception:
             log.exception("post_cfm: failed to announce in %s", g.channel_id)
