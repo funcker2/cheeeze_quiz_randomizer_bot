@@ -391,13 +391,8 @@ async def on_game_name(message: Message, state: FSMContext) -> None:
     country = _get_country(message.from_user.id)
     gid = db.add_game(name, country=country)
     await state.clear()
-    await message.answer(
-        f"🎮 Игра «{name}» создана!\n\nДобавляй розыгрыши:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить розыгрыш", callback_data=f"gadd:{gid}")],
-            [InlineKeyboardButton(text="◀️ К списку игр", callback_data="show_games")],
-        ]),
-    )
+    game = db.get_game(gid)
+    await _show_game(message.chat.id, game)
 
 
 @cmd_router.message(Command("games"))
