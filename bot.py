@@ -1907,12 +1907,32 @@ async def on_confirm(cb: CallbackQuery) -> None:
     if not is_admin(cb.from_user.id):
         return
     gid = int(cb.data.split(":")[1])
-    winners = _pending_winners.pop(gid, [])
+    winners = _pending_winners.get(gid, [])
     g = db.get_giveaway(gid)
     if not g or not winners:
         await cb.answer("Нет данных")
         return
 
+    # If timer is still running — keep pending winner, wait for auto-finish
+    timer = _draw_timers.get(gid)
+    if timer and not timer.done():
+        cd = _cooldown(g.country)
+        remaining = _remaining_time(gid)
+        await cb.message.edit_text(
+            f"⏳ Победитель выбран заранее\n\n"
+            f"🎁 {g.prize_text[:50]}\n"
+            f"{_format_winners(winners)}\n\n"
+            f"{remaining}\n"
+            f"Результат будет опубликован автоматически по окончании таймера.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Перевыбрать", callback_data=f"rr:{gid}")],
+                [InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")],
+            ]),
+        )
+        await cb.answer("Победитель сохранён, ждём таймер")
+        return
+
+    _pending_winners.pop(gid, None)
     for w in winners:
         db.add_winner(gid, w.user_id, w.username, w.full_name)
     db.finish_giveaway(gid)
