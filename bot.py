@@ -2003,6 +2003,13 @@ async def on_post_confirm(cb: CallbackQuery) -> None:
     for w in winners:
         db.add_winner(gid, w.user_id, w.username, w.full_name)
 
+    if g.channel_id:
+        try:
+            announce = f"🔄 Новый победитель розыгрыша:\n\n{_format_winners(winners)}\n\nПриз: {g.prize_text}"
+            await bot.send_message(chat_id=g.channel_id, text=announce)
+        except Exception:
+            log.exception("post_cfm: failed to announce in %s", g.channel_id)
+
     cd = _cooldown(g.country)
     nav_buttons = [
         [InlineKeyboardButton(text="🔄 Перевыбрать победителя", callback_data=f"post_rr:{gid}")],
