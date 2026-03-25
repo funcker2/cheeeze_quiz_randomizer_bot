@@ -76,9 +76,18 @@ def _channel_by_country_idx(country_code: str, idx: int):
     return None
 
 
-def _cooldown() -> int:
+def _cooldown(country_code: str | None = None) -> int:
+    if country_code:
+        val = db.get_setting(f"cooldown_minutes:{country_code}")
+        if val:
+            return int(val)
+        c = cfg.country_by_code(country_code)
+        if c:
+            return c.default_cooldown_minutes
     val = db.get_setting("cooldown_minutes")
-    return int(val) if val else cfg.default_cooldown_minutes
+    if val:
+        return int(val)
+    return 120
 
 
 def _display(p: db.Participant) -> str:
@@ -172,6 +181,20 @@ def _kb_winner(gid: int) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="🔄 Перевыбрать", callback_data=f"rr:{gid}"),
             InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"cfm:{gid}"),
+        ],
+        [InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")],
+    ]
+    if g and g.game_id:
+        buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _kb_post_winner(gid: int) -> InlineKeyboardMarkup:
+    g = db.get_giveaway(gid)
+    buttons = [
+        [
+            InlineKeyboardButton(text="🔄 Перевыбрать", callback_data=f"post_rr:{gid}"),
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"post_cfm:{gid}"),
         ],
         [InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")],
     ]
@@ -302,7 +325,7 @@ async def _show_main_menu(chat_id: int, message_id: int | None = None) -> None:
     country_code = _get_country(uid)
     country = cfg.country_by_code(country_code) if country_code else None
     country_label = country.label if country else "?"
-    cd = _cooldown()
+    cd = _cooldown(country_code)
     buttons = [
         [InlineKeyboardButton(text="🎮 Мои игры", callback_data="show_games")],
         [InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")],
@@ -902,7 +925,8 @@ async def on_go_menu(cb: CallbackQuery) -> None:
 async def on_show_cooldown(cb: CallbackQuery) -> None:
     if not is_admin(cb.from_user.id):
         return
-    cd = _cooldown()
+    country = _get_country(cb.from_user.id)
+    cd = _cooldown(country)
     await cb.answer(f"⏳ Кулдаун: {cd} мин\n\nИзменить: /cooldown 90", show_alert=True)
 
 
@@ -910,7 +934,8 @@ async def on_show_cooldown(cb: CallbackQuery) -> None:
 async def on_show_winners(cb: CallbackQuery) -> None:
     if not is_admin(cb.from_user.id):
         return
-    cd = _cooldown()
+    country = _get_country(cb.from_user.id)
+    cd = _cooldown(country)
     rows = db.recent_winners(cd)
     if not rows:
         await cb.answer("Нет победителей на кулдауне", show_alert=True)
@@ -1204,11 +1229,11 @@ async def on_active_detail(cb: CallbackQuery) -> None:
         await cb.answer("Розыгрыш не найден или уже завершён")
         return
 
+    country_code = g.country or _get_country(cb.from_user.id)
     count = db.participant_count(gid)
-    eligible = len(db.get_eligible(gid, _cooldown()))
+    eligible = len(db.get_eligible(gid, _cooldown(country_code)))
     timer_info = _remaining_time(gid)
     channel_label = g.channel_id
-    country_code = g.country or _get_country(cb.from_user.id)
     for ch in _country_channels(country_code) if country_code else ():
         if ch.id == g.channel_id:
             channel_label = ch.label
@@ -1453,7 +1478,7 @@ async def on_refresh(cb: CallbackQuery) -> None:
         return
 
     count = db.participant_count(gid)
-    eligible = len(db.get_eligible(gid, _cooldown()))
+    eligible = len(db.get_eligible(gid, _cooldown(g.country)))
     has_timer = gid in _draw_timers and not _draw_timers[gid].done()
     mode = "⏱ Таймер активен" if has_timer else "✋ Ручной режим"
 
@@ -1491,7 +1516,7 @@ async def _do_draw(gid: int, chat_id: int, message_id: int | None = None) -> Non
             task.cancel()
     _draw_deadlines.pop(gid, None)
 
-    cd = _cooldown()
+    cd = _cooldown(g.country)
     eligible = db.get_eligible(gid, cd)
     total = db.participant_count(gid)
 
@@ -1633,7 +1658,7 @@ async def _auto_finish(gid: int, admin_chat_id: int) -> None:
     if not g or g.status != "active":
         return
 
-    cd = _cooldown()
+    cd = _cooldown(g.country)
     total = db.participant_count(gid)
     panel = _admin_panels.pop(gid, None)
 
@@ -1763,8 +1788,11 @@ async def on_confirm(cb: CallbackQuery) -> None:
     except Exception:
         log.exception("Failed to update channel post button")
 
-    cd = _cooldown()
-    nav_buttons = [[InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")]]
+    cd = _cooldown(g.country)
+    nav_buttons = [
+        [InlineKeyboardButton(text="🔄 Перевыбрать победителя", callback_data=f"post_rr:{gid}")],
+        [InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")],
+    ]
     if g.game_id:
         nav_buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
     nav_buttons.append([InlineKeyboardButton(text="🎮 К играм", callback_data="show_games")])
@@ -1772,6 +1800,81 @@ async def on_confirm(cb: CallbackQuery) -> None:
         f"✅ Розыгрыш #{gid} завершён\n\n"
         f"🎁 {g.prize_text[:50]}\n"
         f"👥 Участников: {total}\n"
+        f"{_format_winners(winners)}\n"
+        f"⏳ Кулдаун: {cd} мин",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=nav_buttons),
+    )
+    await cb.answer("Подтверждено!")
+
+
+# ── Post-confirm re-roll ─────────────────────────────────
+
+@router.callback_query(F.data.startswith("post_rr:"))
+async def on_post_reroll(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    g = db.get_giveaway(gid)
+    if not g:
+        await cb.answer("Розыгрыш не найден")
+        return
+
+    prev = _pending_winners.get(gid, [])
+    for p in prev:
+        db.add_reject(gid, p.user_id)
+
+    cd = _cooldown(g.country)
+    eligible = db.get_eligible(gid, cd)
+    total = db.participant_count(gid)
+
+    if not eligible:
+        text = f"🎁 {g.prize_text[:50]}\n👥 Участников: {total}\n\n❌ Нет подходящих участников"
+        if total > 0:
+            text += " (все на кулдауне или перебраны)"
+        nav = [[InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")]]
+        if g.game_id:
+            nav.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
+        await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=nav))
+        await cb.answer()
+        return
+
+    winner = random.choice(eligible)
+    _pending_winners[gid] = [winner]
+
+    text = (
+        f"🎁 {g.prize_text[:50]}\n"
+        f"👥 Участников: {total} (подходящих: {len(eligible)})\n\n"
+        f"{_format_winners([winner])}"
+    )
+    await cb.message.edit_text(text, reply_markup=_kb_post_winner(gid))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("post_cfm:"))
+async def on_post_confirm(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    winners = _pending_winners.pop(gid, [])
+    g = db.get_giveaway(gid)
+    if not g or not winners:
+        await cb.answer("Нет данных")
+        return
+
+    for w in winners:
+        db.add_winner(gid, w.user_id, w.username, w.full_name)
+
+    cd = _cooldown(g.country)
+    nav_buttons = [
+        [InlineKeyboardButton(text="🔄 Перевыбрать победителя", callback_data=f"post_rr:{gid}")],
+        [InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")],
+    ]
+    if g.game_id:
+        nav_buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
+    nav_buttons.append([InlineKeyboardButton(text="🎮 К играм", callback_data="show_games")])
+    await cb.message.edit_text(
+        f"✅ Победитель перевыбран\n\n"
+        f"🎁 {g.prize_text[:50]}\n"
         f"{_format_winners(winners)}\n"
         f"⏳ Кулдаун: {cd} мин",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=nav_buttons),
@@ -1820,10 +1923,16 @@ async def cmd_finish(message: Message) -> None:
 async def cmd_cooldown(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
+    country = _get_country(message.from_user.id)
+    if not country:
+        await message.answer("Сначала выбери страну: /start")
+        return
+    country_obj = cfg.country_by_code(country)
+    country_label = country_obj.label if country_obj else country
     parts = message.text.strip().split()
-    current = _cooldown()
+    current = _cooldown(country)
     if len(parts) < 2:
-        await message.answer(f"⏳ Кулдаун: {current} мин\n\nИзменить: /cooldown 90")
+        await message.answer(f"⏳ Кулдаун ({country_label}): {current} мин\n\nИзменить: /cooldown 90")
         return
 
     try:
@@ -1834,8 +1943,8 @@ async def cmd_cooldown(message: Message) -> None:
         await message.answer("Нужно положительное число.")
         return
 
-    db.set_setting("cooldown_minutes", str(val))
-    await message.answer(f"✅ Кулдаун: {current} → {val} мин")
+    db.set_setting(f"cooldown_minutes:{country}", str(val))
+    await message.answer(f"✅ Кулдаун ({country_label}): {current} → {val} мин")
 
 
 # ── /winners ─────────────────────────────────────────────
@@ -1844,7 +1953,7 @@ async def cmd_cooldown(message: Message) -> None:
 async def cmd_winners(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
-    cd = _cooldown()
+    cd = _cooldown(_get_country(message.from_user.id))
     rows = db.recent_winners(cd)
     if not rows:
         await message.answer("Нет победителей на кулдауне.")
@@ -1917,10 +2026,10 @@ async def main() -> None:
     for c in cfg.countries:
         ch_names = ", ".join(ch.label for ch in c.channels)
         log.info(
-            "Country %s (%s) — admins=%s, channels=[%s]",
-            c.code, c.label, c.admin_ids, ch_names,
+            "Country %s (%s) — admins=%s, channels=[%s], cooldown=%d min",
+            c.code, c.label, c.admin_ids, ch_names, c.default_cooldown_minutes,
         )
-    log.info("Bot starting — cooldown=%d min", cfg.default_cooldown_minutes)
+    log.info("Bot starting")
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
