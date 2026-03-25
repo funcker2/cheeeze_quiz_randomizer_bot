@@ -246,8 +246,7 @@ def _kb_game_giveaways(game: db.Game, queue: list[db.Giveaway], page: int = 0) -
             nav.append(InlineKeyboardButton(text="▶️", callback_data=f"gpage:{game.id}:{page + 1}"))
         buttons.append(nav)
     buttons.append([
-        InlineKeyboardButton(text="➕ Новый розыгрыш", callback_data=f"gadd:{game.id}"),
-        InlineKeyboardButton(text="📚 Из библиотеки", callback_data=f"glib:{game.id}"),
+        InlineKeyboardButton(text="📚 Добавить из библиотеки", callback_data=f"glib:{game.id}"),
     ])
     buttons.append([
         InlineKeyboardButton(text="🟢 Активные", callback_data="show_active"),
