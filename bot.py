@@ -250,7 +250,7 @@ def _kb_game_giveaways(game: db.Game, queue: list[db.Giveaway], page: int = 0) -
     ])
     buttons.append([
         InlineKeyboardButton(text="🟢 Активные", callback_data="show_active"),
-        InlineKeyboardButton(text="✅ Завершённые", callback_data=f"show_fin:{game.id}"),
+        InlineKeyboardButton(text="🔴 Завершённые", callback_data=f"show_fin:{game.id}"),
     ])
     buttons.append([InlineKeyboardButton(text="◀️ К списку игр", callback_data="show_games")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1021,12 +1021,12 @@ async def on_show_finished(cb: CallbackQuery) -> None:
         winners = db.get_giveaway_winners(g.id)
         w_str = ", ".join(_display(w) for w in winners) if winners else "—"
         buttons.append([InlineKeyboardButton(
-            text=f"✅ #{g.id}: {label}",
+            text=f"🔴 #{g.id}: {label}",
             callback_data=f"fin:{g.id}",
         )])
     buttons.append([InlineKeyboardButton(text="◀️ К игре", callback_data=f"game:{game_id}")])
     await cb.message.edit_text(
-        f"✅ Завершённые — {game.name} ({len(finished)}):",
+        f"🔴 Завершённые — {game.name} ({len(finished)}):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await cb.answer()
@@ -1047,7 +1047,7 @@ async def on_finished_giveaway(cb: CallbackQuery) -> None:
     eligible = db.get_eligible(gid, cd)
     winners_text = _format_winners(winners) if winners else "🏆 Победителей нет"
     text = (
-        f"✅ Розыгрыш #{gid}: {_giveaway_label(g)}\n"
+        f"🔴 Розыгрыш #{gid}: {_giveaway_label(g)}\n"
         f"🎁 {g.prize_text[:80]}\n"
         f"👥 Участников: {total} (подходящих для перевыбора: {len(eligible)})\n\n"
         f"{winners_text}"
