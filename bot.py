@@ -1020,7 +1020,7 @@ async def on_view_giveaway(cb: CallbackQuery) -> None:
     if g.game_id:
         channels = _country_channels(country_code) if country_code else ()
         top_buttons = [
-            [InlineKeyboardButton(text=f"📢 {ch.label}", callback_data=f"ch:{i}:{gid}")]
+            [InlineKeyboardButton(text=ch.label, callback_data=f"ch:{i}:{gid}")]
             for i, ch in enumerate(channels)
         ]
     else:
