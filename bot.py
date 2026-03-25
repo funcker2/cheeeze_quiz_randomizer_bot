@@ -201,6 +201,7 @@ def _kb_post_winner(gid: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🔄 Перевыбрать", callback_data=f"post_rr:{gid}"),
             InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"post_cfm:{gid}"),
         ],
+        [InlineKeyboardButton(text="◀️ К розыгрышу", callback_data=f"fin:{gid}")],
         [InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")],
     ]
     if g and g.game_id:
@@ -248,7 +249,10 @@ def _kb_game_giveaways(game: db.Game, queue: list[db.Giveaway], page: int = 0) -
         InlineKeyboardButton(text="➕ Новый розыгрыш", callback_data=f"gadd:{game.id}"),
         InlineKeyboardButton(text="📚 Из библиотеки", callback_data=f"glib:{game.id}"),
     ])
-    buttons.append([InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")])
+    buttons.append([
+        InlineKeyboardButton(text="🟢 Активные", callback_data="show_active"),
+        InlineKeyboardButton(text="✅ Завершённые", callback_data=f"show_fin:{game.id}"),
+    ])
     buttons.append([InlineKeyboardButton(text="◀️ К списку игр", callback_data="show_games")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -993,6 +997,133 @@ async def on_show_active(cb: CallbackQuery) -> None:
     await cb.message.answer(
         f"🟢 Активные розыгрыши ({len(active)}):",
         reply_markup=_kb_active_list(active),
+    )
+    await cb.answer()
+
+
+# ── Finished giveaways ──────────────────────────────────
+
+@router.callback_query(F.data.startswith("show_fin:"))
+async def on_show_finished(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    game_id = int(cb.data.split(":")[1])
+    game = db.get_game(game_id)
+    if not game:
+        await cb.answer("Игра не найдена")
+        return
+    finished = db.get_finished_by_game(game_id)
+    if not finished:
+        await cb.answer("Нет завершённых розыгрышей", show_alert=True)
+        return
+    buttons = []
+    for g in finished:
+        label = _giveaway_label(g)
+        winners = db.get_giveaway_winners(g.id)
+        w_str = ", ".join(_display(w) for w in winners) if winners else "—"
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ #{g.id}: {label}",
+            callback_data=f"fin:{g.id}",
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ К игре", callback_data=f"game:{game_id}")])
+    await cb.message.edit_text(
+        f"✅ Завершённые — {game.name} ({len(finished)}):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("fin:"))
+async def on_finished_giveaway(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    g = db.get_giveaway(gid)
+    if not g:
+        await cb.answer("Не найден")
+        return
+    winners = db.get_giveaway_winners(gid)
+    total = db.participant_count(gid)
+    cd = _cooldown(g.country)
+    eligible = db.get_eligible(gid, cd)
+    winners_text = _format_winners(winners) if winners else "🏆 Победителей нет"
+    text = (
+        f"✅ Розыгрыш #{gid}: {_giveaway_label(g)}\n"
+        f"🎁 {g.prize_text[:80]}\n"
+        f"👥 Участников: {total} (подходящих для перевыбора: {len(eligible)})\n\n"
+        f"{winners_text}"
+    )
+    buttons = []
+    if eligible:
+        buttons.append([InlineKeyboardButton(text="🔄 Перевыбрать из возможных", callback_data=f"post_rr:{gid}")])
+    buttons.append([InlineKeyboardButton(text="👤 Назначить из списка", callback_data=f"assign_list:{gid}")])
+    if g.game_id:
+        buttons.append([InlineKeyboardButton(text="◀️ К завершённым", callback_data=f"show_fin:{g.game_id}")])
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("assign_list:"))
+async def on_assign_list(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    parts = cb.data.split(":")
+    gid = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
+    g = db.get_giveaway(gid)
+    if not g:
+        await cb.answer("Не найден")
+        return
+    participants = db.get_participants(gid)
+    if not participants:
+        await cb.answer("Нет участников", show_alert=True)
+        return
+    page_items, total_pages = _paginate(participants, page)
+    buttons = []
+    for p in page_items:
+        buttons.append([InlineKeyboardButton(
+            text=_display(p),
+            callback_data=f"assignpick:{gid}:{p.user_id}",
+        )])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"assign_list:{gid}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"assign_list:{gid}:{page + 1}"))
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"fin:{gid}")])
+    await cb.message.edit_text(
+        f"👤 Выбери победителя ({len(participants)} участников):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("assignpick:"))
+async def on_assign_pick(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    _, gid_s, uid_s = cb.data.split(":")
+    gid, user_id = int(gid_s), int(uid_s)
+    g = db.get_giveaway(gid)
+    p = db.get_participant(gid, user_id)
+    if not g or not p:
+        await cb.answer("Не найден")
+        return
+    db.add_winner(gid, p.user_id, p.username, p.full_name)
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Перевыбрать из возможных", callback_data=f"post_rr:{gid}")],
+        [InlineKeyboardButton(text="👤 Назначить из списка", callback_data=f"assign_list:{gid}")],
+    ]
+    if g.game_id:
+        buttons.append([InlineKeyboardButton(text="◀️ К завершённым", callback_data=f"show_fin:{g.game_id}")])
+    await cb.message.edit_text(
+        f"✅ Победитель назначен\n\n"
+        f"🎁 {g.prize_text[:50]}\n"
+        f"🏆 {_display(p)}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await cb.answer()
 

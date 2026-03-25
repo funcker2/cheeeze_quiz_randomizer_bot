@@ -490,6 +490,36 @@ def get_participants(gid: int) -> list[Participant]:
     return [Participant(*r) for r in rows]
 
 
+def get_participant(gid: int, user_id: int) -> "Participant | None":
+    conn = _conn()
+    row = conn.execute(
+        "SELECT user_id, username, full_name FROM participants WHERE giveaway_id=? AND user_id=?",
+        (gid, user_id),
+    ).fetchone()
+    conn.close()
+    return Participant(*row) if row else None
+
+
+def get_finished_by_game(game_id: int) -> list[Giveaway]:
+    conn = _conn()
+    rows = conn.execute(
+        f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE game_id=? AND status='finished' ORDER BY id DESC",
+        (game_id,),
+    ).fetchall()
+    conn.close()
+    return [Giveaway(*r) for r in rows]
+
+
+def get_giveaway_winners(gid: int) -> list[Participant]:
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT user_id, username, full_name FROM winners WHERE giveaway_id=? ORDER BY id",
+        (gid,),
+    ).fetchall()
+    conn.close()
+    return [Participant(*r) for r in rows]
+
+
 # ── Winners / Rejects ────────────────────────────────────
 
 def add_winner(gid: int, user_id: int, username: str | None, full_name: str) -> None:
