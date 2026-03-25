@@ -524,7 +524,7 @@ async def on_delete_game_ask(cb: CallbackQuery) -> None:
         f"📋 В очереди: {queued}\n"
         f"🟢 Активных: {active}\n"
         f"✅ Завершено: {finished}\n\n"
-        "Розыгрыши не удалятся — переместятся в библиотеку."
+        "Все копии розыгрышей в этой игре будут удалены. Оригиналы в библиотеке сохранятся."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -550,7 +550,7 @@ async def on_delete_game(cb: CallbackQuery) -> None:
         return
     db.delete_game(game_id)
     await _show_games(cb.message.chat.id, cb.message.message_id)
-    await cb.answer(f"Игра «{game.name}» удалена — розыгрыши сохранены в библиотеке")
+    await cb.answer(f"Игра «{game.name}» удалена")
 
 
 # ── Library (free giveaways) ────────────────────────────
@@ -701,11 +701,11 @@ async def on_library_pick(cb: CallbackQuery) -> None:
         return
     parts = cb.data.split(":")
     game_id, gid = int(parts[1]), int(parts[2])
-    db.assign_to_game(gid, game_id)
+    db.copy_giveaway(gid, game_id)
     game = db.get_game(game_id)
     if game:
         await _show_game(cb.message.chat.id, game, cb.message.message_id)
-    await cb.answer(f"Розыгрыш #{gid} добавлен в игру")
+    await cb.answer(f"Копия розыгрыша #{gid} добавлена в игру")
 
 
 @router.callback_query(F.data.startswith("lib2game:"))
@@ -714,11 +714,11 @@ async def on_lib_to_game(cb: CallbackQuery) -> None:
         return
     parts = cb.data.split(":")
     gid, game_id = int(parts[1]), int(parts[2])
-    db.assign_to_game(gid, game_id)
+    db.copy_giveaway(gid, game_id)
     game = db.get_game(game_id)
     if game:
         await _show_game(cb.message.chat.id, game, cb.message.message_id)
-    await cb.answer(f"Розыгрыш #{gid} добавлен в «{game.name}»" if game else f"Розыгрыш #{gid} добавлен")
+    await cb.answer(f"Копия розыгрыша #{gid} добавлена в «{game.name}»" if game else f"Копия розыгрыша #{gid} добавлена")
 
 
 # ── Add giveaway to game ────────────────────────────────

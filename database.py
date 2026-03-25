@@ -39,6 +39,7 @@ class Giveaway:
     draw_deadline: str | None
     admin_chat_id: int | None
     country: str | None
+    source_id: int | None
 
 
 @dataclass
@@ -50,7 +51,7 @@ class Participant:
 
 _GIVEAWAY_COLS = (
     "id, game_id, name, prize_text, prize_entities, photo_id, winner_count, "
-    "status, created_at, channel_message_id, channel_id, draw_deadline, admin_chat_id, country"
+    "status, created_at, channel_message_id, channel_id, draw_deadline, admin_chat_id, country, source_id"
 )
 
 
@@ -118,6 +119,8 @@ def init_db() -> None:
         conn.execute("ALTER TABLE giveaways ADD COLUMN name TEXT")
     if "country" not in cols:
         conn.execute("ALTER TABLE giveaways ADD COLUMN country TEXT")
+    if "source_id" not in cols:
+        conn.execute("ALTER TABLE giveaways ADD COLUMN source_id INTEGER")
 
     game_cols = {r[1] for r in conn.execute("PRAGMA table_info(games)").fetchall()}
     if "country" not in game_cols:
@@ -185,18 +188,16 @@ def get_game(game_id: int) -> Game | None:
 
 def delete_game(game_id: int) -> bool:
     conn = _conn()
-    # Clear participants and rejects for finished giveaways returning to library
+    # Delete all copies (giveaways) belonging to this game along with their data
     conn.execute(
-        "DELETE FROM participants WHERE giveaway_id IN "
-        "(SELECT id FROM giveaways WHERE game_id=? AND status='finished')",
+        "DELETE FROM participants WHERE giveaway_id IN (SELECT id FROM giveaways WHERE game_id=?)",
         (game_id,),
     )
     conn.execute(
-        "DELETE FROM draw_rejects WHERE giveaway_id IN "
-        "(SELECT id FROM giveaways WHERE game_id=? AND status='finished')",
+        "DELETE FROM draw_rejects WHERE giveaway_id IN (SELECT id FROM giveaways WHERE game_id=?)",
         (game_id,),
     )
-    conn.execute("UPDATE giveaways SET game_id=NULL WHERE game_id=?", (game_id,))
+    conn.execute("DELETE FROM giveaways WHERE game_id=?", (game_id,))
     cur = conn.execute("DELETE FROM games WHERE id=?", (game_id,))
     conn.commit()
     conn.close()
@@ -279,6 +280,42 @@ def assign_to_game(gid: int, game_id: int) -> bool:
     conn.commit()
     conn.close()
     return True
+
+
+def copy_giveaway(source_id: int, game_id: int) -> int:
+    """Create a copy of a library giveaway and add it to a game.
+
+    The copy gets a sequential №N suffix so copies can be told apart.
+    Returns the new giveaway id, or 0 if source not found.
+    """
+    conn = _conn()
+    row = conn.execute(
+        f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE id=?", (source_id,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        return 0
+    g = Giveaway(*row)
+
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM giveaways WHERE source_id=?", (source_id,)
+    ).fetchone()[0]
+    copy_number = existing + 1
+
+    base_name = g.name or g.prize_text[:30]
+    copy_name = f"{base_name} №{copy_number}"
+
+    cur = conn.execute(
+        "INSERT INTO giveaways "
+        "(game_id, name, prize_text, prize_entities, photo_id, winner_count, created_at, country, source_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (game_id, copy_name, g.prize_text, g.prize_entities, g.photo_id,
+         g.winner_count, _now(), g.country, source_id),
+    )
+    new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
 
 
 def reset_giveaway(gid: int) -> bool:
