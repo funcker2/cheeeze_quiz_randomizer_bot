@@ -18,13 +18,13 @@ class Country:
     label: str
     admin_ids: tuple[int, ...]
     channels: tuple[Channel, ...]
+    default_cooldown_minutes: int
 
 
 @dataclass(frozen=True)
 class Config:
     bot_token: str
     countries: tuple[Country, ...]
-    default_cooldown_minutes: int
 
     @property
     def all_admin_ids(self) -> set[int]:
@@ -80,15 +80,13 @@ class Config:
                 raise ValueError(f"ADMINS_{code} is not set")
             if not channels:
                 raise ValueError(f"CHANNELS_{code} is not set")
-            countries.append(Country(code=code, label=label, admin_ids=admins, channels=channels))
+            cooldown = int(getenv(f"COOLDOWN_{code}", getenv("COOLDOWN_MINUTES", "120")))
+            countries.append(Country(code=code, label=label, admin_ids=admins, channels=channels, default_cooldown_minutes=cooldown))
 
         if not countries:
             raise ValueError("COUNTRIES is not set — use format: code1|Label1;code2|Label2")
 
-        cooldown = int(getenv("COOLDOWN_MINUTES", "120"))
-
         return cls(
             bot_token=token,
             countries=tuple(countries),
-            default_cooldown_minutes=cooldown,
         )
