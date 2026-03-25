@@ -1732,13 +1732,22 @@ async def _auto_finish(gid: int, admin_chat_id: int) -> None:
     if pick_count < g.winner_count:
         admin_text += f"\n⚠️ Подходящих меньше чем нужно ({pick_count}/{g.winner_count})"
 
+    nav_buttons = [
+        [InlineKeyboardButton(text="🔄 Перевыбрать победителя", callback_data=f"post_rr:{gid}")],
+        [InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")],
+    ]
+    if g.game_id:
+        nav_buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
+    nav_buttons.append([InlineKeyboardButton(text="🎮 К играм", callback_data="show_games")])
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=nav_buttons)
+
     if panel:
         try:
-            await bot.edit_message_text(admin_text, chat_id=panel[0], message_id=panel[1])
+            await bot.edit_message_text(admin_text, chat_id=panel[0], message_id=panel[1], reply_markup=admin_kb)
         except Exception:
-            await bot.send_message(admin_chat_id, admin_text)
+            await bot.send_message(admin_chat_id, admin_text, reply_markup=admin_kb)
     else:
-        await bot.send_message(admin_chat_id, admin_text)
+        await bot.send_message(admin_chat_id, admin_text, reply_markup=admin_kb)
 
 
 # ── Re-roll ──────────────────────────────────────────────
