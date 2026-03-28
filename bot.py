@@ -1,4 +1,5 @@
 import asyncio
+import html as html_module
 import json
 import logging
 import random
@@ -99,6 +100,40 @@ def _display(p: db.Participant) -> str:
     if p.username:
         return f"@{p.username} ({p.full_name})"
     return p.full_name
+
+
+def _display_html(p: db.Participant) -> str:
+    """HTML mention: @username if exists, otherwise clickable tg://user?id= link."""
+    name = html_module.escape(p.full_name)
+    if p.username:
+        return f"@{p.username} ({name})"
+    return f'<a href="tg://user?id={p.user_id}">{name}</a>'
+
+
+def _format_winners_html(winners: list[db.Participant]) -> str:
+    if len(winners) == 1:
+        return f"🏆 Победитель: {_display_html(winners[0])}"
+    lines = ["🏆 Победители:"]
+    for i, w in enumerate(winners, 1):
+        lines.append(f"  {i}. {_display_html(w)}")
+    return "\n".join(lines)
+
+
+async def _send_result_to_channel(g: db.Giveaway, winners: list[db.Participant]) -> None:
+    """Send winner announcement as a reply to the original giveaway post."""
+    if not g.channel_id:
+        return
+    announce = (
+        f"🎉 Результаты розыгрыша:\n\n"
+        f"{_format_winners_html(winners)}\n\n"
+        f"Приз: {html_module.escape(g.prize_text)}"
+    )
+    await bot.send_message(
+        chat_id=g.channel_id,
+        text=announce,
+        parse_mode="HTML",
+        reply_to_message_id=g.channel_message_id,
+    )
 
 
 def _serialize_entities(entities: list[MessageEntity] | None) -> str | None:
@@ -1113,8 +1148,7 @@ async def on_assign_pick(cb: CallbackQuery) -> None:
 
     if g.channel_id:
         try:
-            announce = f"🎉 Результаты розыгрыша:\n\n{_format_winners([p])}\n\nПриз: {g.prize_text}"
-            await bot.send_message(chat_id=g.channel_id, text=announce)
+            await _send_result_to_channel(g, [p])
         except Exception:
             log.exception("assignpick: failed to announce in %s", g.channel_id)
 
@@ -1844,8 +1878,7 @@ async def _auto_finish(gid: int, admin_chat_id: int) -> None:
     db.finish_giveaway(gid)
 
     try:
-        announce = f"🎉 Результаты розыгрыша:\n\n{_format_winners(winners)}\n\nПриз: {g.prize_text}"
-        await bot.send_message(chat_id=g.channel_id, text=announce)
+        await _send_result_to_channel(g, winners)
     except Exception:
         log.exception("Auto-finish: failed to announce in %s", g.channel_id)
 
@@ -1941,8 +1974,7 @@ async def on_confirm(cb: CallbackQuery) -> None:
     total = db.participant_count(gid)
 
     try:
-        announce = f"🎉 Результаты розыгрыша:\n\n{_format_winners(winners)}\n\nПриз: {g.prize_text}"
-        await bot.send_message(chat_id=g.channel_id, text=announce)
+        await _send_result_to_channel(g, winners)
     except Exception:
         log.exception("Failed to announce winner in %s", g.channel_id)
 
@@ -2033,8 +2065,7 @@ async def on_post_confirm(cb: CallbackQuery) -> None:
 
     if g.channel_id:
         try:
-            announce = f"🎉 Результаты розыгрыша:\n\n{_format_winners(winners)}\n\nПриз: {g.prize_text}"
-            await bot.send_message(chat_id=g.channel_id, text=announce)
+            await _send_result_to_channel(g, winners)
         except Exception:
             log.exception("post_cfm: failed to announce in %s", g.channel_id)
 
