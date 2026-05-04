@@ -215,30 +215,38 @@ def _remaining_time(gid: int) -> str:
     return f"⏱ До розыгрыша: {seconds} сек"
 
 
-def _kb_winner(gid: int) -> InlineKeyboardMarkup:
+def _kb_winner(gid: int, winner_uid: int | None = None) -> InlineKeyboardMarkup:
     g = db.get_giveaway(gid)
     buttons = [
         [
             InlineKeyboardButton(text="🔄 Перевыбрать", callback_data=f"rr:{gid}"),
             InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"cfm:{gid}"),
         ],
-        [InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")],
     ]
+    if winner_uid is not None:
+        buttons.append([
+            InlineKeyboardButton(text="🚫 Забанить + перевыбрать", callback_data=f"ban_win:{gid}:{winner_uid}"),
+        ])
+    buttons.append([InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")])
     if g and g.game_id:
         buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def _kb_post_winner(gid: int) -> InlineKeyboardMarkup:
+def _kb_post_winner(gid: int, winner_uid: int | None = None) -> InlineKeyboardMarkup:
     g = db.get_giveaway(gid)
     buttons = [
         [
             InlineKeyboardButton(text="🔄 Перевыбрать", callback_data=f"post_rr:{gid}"),
             InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"post_cfm:{gid}"),
         ],
-        [InlineKeyboardButton(text="◀️ К розыгрышу", callback_data=f"fin:{gid}")],
-        [InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")],
     ]
+    if winner_uid is not None:
+        buttons.append([
+            InlineKeyboardButton(text="🚫 Забанить + перевыбрать", callback_data=f"ban_win:{gid}:{winner_uid}"),
+        ])
+    buttons.append([InlineKeyboardButton(text="◀️ К розыгрышу", callback_data=f"fin:{gid}")])
+    buttons.append([InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")])
     if g and g.game_id:
         buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1718,7 +1726,8 @@ async def _do_draw(gid: int, chat_id: int, message_id: int | None = None) -> Non
     if pick_count < g.winner_count:
         text += f"\n\n⚠️ Подходящих участников меньше чем нужно ({pick_count}/{g.winner_count})"
 
-    kb = _kb_winner(gid)
+    single_uid = winners[0].user_id if len(winners) == 1 else None
+    kb = _kb_winner(gid, winner_uid=single_uid)
     if message_id:
         try:
             await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
@@ -1760,6 +1769,7 @@ async def on_pick_list(cb: CallbackQuery) -> None:
         label = f"@{p.username}" if p.username else p.full_name
         buttons.append([
             InlineKeyboardButton(text=label, callback_data=f"setwin:{gid}:{p.user_id}"),
+            InlineKeyboardButton(text="🚫", callback_data=f"ban_p:{gid}:{p.user_id}:{page}"),
         ])
     if total_pages > 1:
         nav = []
@@ -1807,7 +1817,7 @@ async def on_set_winner(cb: CallbackQuery) -> None:
         f"{_format_winners([winner])}"
         f"{timer_note}"
     )
-    kb = _kb_winner(gid)
+    kb = _kb_winner(gid, winner_uid=winner.user_id)
     try:
         await cb.message.edit_text(text, reply_markup=kb)
     except Exception:
@@ -2045,7 +2055,7 @@ async def on_post_reroll(cb: CallbackQuery) -> None:
         f"👥 Участников: {total} (подходящих: {len(eligible)})\n\n"
         f"{_format_winners([winner])}"
     )
-    await cb.message.edit_text(text, reply_markup=_kb_post_winner(gid))
+    await cb.message.edit_text(text, reply_markup=_kb_post_winner(gid, winner_uid=winner.user_id))
     await cb.answer()
 
 
@@ -2181,6 +2191,225 @@ async def cmd_reset(message: Message) -> None:
     await message.answer(f"✅ Кулдауны сброшены ({n} записей).")
 
 
+# ── /ban <user_id> ───────────────────────────────────────
+
+@cmd_router.message(Command("ban"))
+async def cmd_ban(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    country = _get_country(message.from_user.id)
+    if not country:
+        await message.answer("Сначала выбери страну: /start")
+        return
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        await message.answer("Использование: /ban <user_id>")
+        return
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    added = db.add_to_blacklist(target_id, country, None, str(target_id))
+    country_obj = cfg.country_by_code(country)
+    country_label = country_obj.label if country_obj else country
+    if added:
+        await message.answer(f"🚫 Пользователь {target_id} добавлен в чёрный список ({country_label}).")
+    else:
+        await message.answer(f"⚠️ Пользователь {target_id} уже в чёрном списке ({country_label}).")
+
+
+# ── /blacklist ────────────────────────────────────────────
+
+def _kb_blacklist(entries: list[db.Participant], country: str, page: int) -> InlineKeyboardMarkup:
+    page_items, total_pages = _paginate(entries, page)
+    buttons = []
+    for p in page_items:
+        label = f"@{p.username} ({p.full_name})" if p.username else p.full_name
+        buttons.append([
+            InlineKeyboardButton(text=label[:40], callback_data="noop"),
+            InlineKeyboardButton(text="❌", callback_data=f"unban:{p.user_id}:{country}"),
+        ])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"bl_page:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"bl_page:{page + 1}"))
+        buttons.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@cmd_router.message(Command("blacklist"))
+async def cmd_blacklist(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    country = _get_country(message.from_user.id)
+    if not country:
+        await message.answer("Сначала выбери страну: /start")
+        return
+    entries = db.get_blacklist(country)
+    country_obj = cfg.country_by_code(country)
+    country_label = country_obj.label if country_obj else country
+    if not entries:
+        await message.answer(f"🚫 Чёрный список ({country_label}) пуст.")
+        return
+    kb = _kb_blacklist(entries, country, 0)
+    await message.answer(f"🚫 Чёрный список ({country_label}) — {len(entries)} чел.:", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("bl_page:"))
+async def on_bl_page(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    page = int(cb.data.split(":")[1])
+    country = _get_country(cb.from_user.id)
+    if not country:
+        await cb.answer("Сначала выбери страну: /start")
+        return
+    entries = db.get_blacklist(country)
+    country_obj = cfg.country_by_code(country)
+    country_label = country_obj.label if country_obj else country
+    kb = _kb_blacklist(entries, country, page)
+    await cb.message.edit_reply_markup(reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("unban:"))
+async def on_unban(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    parts = cb.data.split(":")
+    target_id, country = int(parts[1]), parts[2]
+    removed = db.remove_from_blacklist(target_id, country)
+    if not removed:
+        await cb.answer("Не найден в чёрном списке.")
+        return
+    entries = db.get_blacklist(country)
+    country_obj = cfg.country_by_code(country)
+    country_label = country_obj.label if country_obj else country
+    if not entries:
+        await cb.message.edit_text(f"🚫 Чёрный список ({country_label}) пуст.")
+        await cb.answer("✅ Разбанен.")
+        return
+    kb = _kb_blacklist(entries, country, 0)
+    await cb.message.edit_text(
+        f"🚫 Чёрный список ({country_label}) — {len(entries)} чел.:",
+        reply_markup=kb,
+    )
+    await cb.answer("✅ Разбанен.")
+
+
+# ── ban_win: blacklist winner from draw screen + reroll ───
+
+@router.callback_query(F.data.startswith("ban_win:"))
+async def on_ban_winner(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    parts = cb.data.split(":")
+    gid, target_uid = int(parts[1]), int(parts[2])
+    g = db.get_giveaway(gid)
+    if not g:
+        await cb.answer("Розыгрыш не найден")
+        return
+    country = g.country or _get_country(cb.from_user.id)
+    if not country:
+        await cb.answer("Страна не определена")
+        return
+
+    # resolve display name from participants or pending
+    participant = db.get_participant(gid, target_uid)
+    username = participant.username if participant else None
+    full_name = participant.full_name if participant else str(target_uid)
+
+    db.add_to_blacklist(target_uid, country, username, full_name)
+    # also reject them for this draw so reroll skips them immediately
+    db.add_reject(gid, target_uid)
+    _pending_winners.pop(gid, None)
+
+    await cb.answer(f"🚫 {full_name} забанен.")
+
+    if g.status == "active":
+        await _do_draw(gid, cb.message.chat.id, cb.message.message_id)
+    else:
+        # post-confirm context — use post_rr flow
+        cd = _cooldown(g.country)
+        eligible = db.get_eligible(gid, cd)
+        total = db.participant_count(gid)
+        if not eligible:
+            text = f"🎁 {g.prize_text[:50]}\n👥 Участников: {total}\n\n❌ Нет подходящих участников"
+            nav = [[InlineKeyboardButton(text="🟢 Активные розыгрыши", callback_data="show_active")]]
+            if g.game_id:
+                nav.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
+            await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=nav))
+            return
+        winner = random.choice(eligible)
+        _pending_winners[gid] = [winner]
+        text = (
+            f"🎁 {g.prize_text[:50]}\n"
+            f"👥 Участников: {total} (подходящих: {len(eligible)})\n\n"
+            f"{_format_winners([winner])}"
+        )
+        await cb.message.edit_text(text, reply_markup=_kb_post_winner(gid, winner_uid=winner.user_id))
+
+
+# ── ban_p: blacklist participant from pick list ───────────
+
+@router.callback_query(F.data.startswith("ban_p:"))
+async def on_ban_participant(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    parts = cb.data.split(":")
+    gid, target_uid, page = int(parts[1]), int(parts[2]), int(parts[3])
+    g = db.get_giveaway(gid)
+    if not g:
+        await cb.answer("Розыгрыш не найден")
+        return
+    country = g.country or _get_country(cb.from_user.id)
+    if not country:
+        await cb.answer("Страна не определена")
+        return
+
+    participant = db.get_participant(gid, target_uid)
+    username = participant.username if participant else None
+    full_name = participant.full_name if participant else str(target_uid)
+
+    db.add_to_blacklist(target_uid, country, username, full_name)
+    await cb.answer(f"🚫 {full_name} забанен.")
+
+    # Refresh the pick list
+    participants = db.get_participants(gid)
+    if not participants:
+        await cb.message.edit_text("Нет участников.", reply_markup=None)
+        return
+    # clamp page in case last item on page was banned
+    total_pages = max(1, (len(participants) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(page, total_pages - 1)
+    page_items, total_pages = _paginate(participants, page)
+    buttons = []
+    for p in page_items:
+        label = f"@{p.username}" if p.username else p.full_name
+        buttons.append([
+            InlineKeyboardButton(text=label, callback_data=f"setwin:{gid}:{p.user_id}"),
+            InlineKeyboardButton(text="🚫", callback_data=f"ban_p:{gid}:{p.user_id}:{page}"),
+        ])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"pick:{gid}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"pick:{gid}:{page + 1}"))
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"act:{gid}")])
+    await cb.message.edit_text(
+        f"👤 Выбери победителя ({len(participants)}):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
 # ── Entry point ──────────────────────────────────────────
 
 async def _restore_timers() -> None:
@@ -2238,6 +2467,8 @@ async def main() -> None:
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="blacklist", description="Чёрный список"),
+        BotCommand(command="ban", description="Забанить по ID"),
     ])
 
     await _restore_timers()

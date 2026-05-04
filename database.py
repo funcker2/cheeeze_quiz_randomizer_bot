@@ -107,6 +107,15 @@ def init_db() -> None:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS blacklist (
+            user_id   INTEGER NOT NULL,
+            country   TEXT NOT NULL,
+            username  TEXT,
+            full_name TEXT NOT NULL,
+            added_at  TEXT NOT NULL,
+            PRIMARY KEY (user_id, country)
+        );
     """)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(giveaways)").fetchall()}
     if "game_id" not in cols:
@@ -457,7 +466,7 @@ def participant_count(gid: int) -> int:
 
 
 def get_eligible(gid: int, cooldown_minutes: int) -> list[Participant]:
-    """Participants minus recent winners (cooldown) and re-roll rejects."""
+    """Participants minus recent winners (cooldown), re-roll rejects, and blacklisted users."""
     conn = _conn()
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=cooldown_minutes)).isoformat()
 
@@ -469,7 +478,19 @@ def get_eligible(gid: int, cooldown_minutes: int) -> list[Participant]:
         "SELECT user_id FROM draw_rejects WHERE giveaway_id=?", (gid,)
     ).fetchall()}
 
-    excluded = cooled | rejected
+    country_row = conn.execute(
+        "SELECT country FROM giveaways WHERE id=?", (gid,)
+    ).fetchone()
+    country = country_row[0] if country_row else None
+
+    if country:
+        banned = {r[0] for r in conn.execute(
+            "SELECT user_id FROM blacklist WHERE country=?", (country,)
+        ).fetchall()}
+    else:
+        banned = set()
+
+    excluded = cooled | rejected | banned
 
     rows = conn.execute(
         "SELECT user_id, username, full_name FROM participants WHERE giveaway_id=?",
@@ -578,3 +599,52 @@ def clear_winners() -> int:
     n = cur.rowcount
     conn.close()
     return n
+
+
+# ── Blacklist ─────────────────────────────────────────────
+
+def add_to_blacklist(user_id: int, country: str, username: str | None, full_name: str) -> bool:
+    """Add user to blacklist for a country. Returns True if newly added, False if already present."""
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO blacklist (user_id, country, username, full_name, added_at) VALUES (?,?,?,?,?)",
+            (user_id, country, username, full_name, _now()),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def remove_from_blacklist(user_id: int, country: str) -> bool:
+    """Remove user from blacklist for a country. Returns True if removed."""
+    conn = _conn()
+    cur = conn.execute(
+        "DELETE FROM blacklist WHERE user_id=? AND country=?", (user_id, country)
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def get_blacklist(country: str) -> list[Participant]:
+    """Return all blacklisted users for a country, as Participant objects."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT user_id, username, full_name FROM blacklist WHERE country=? ORDER BY added_at DESC",
+        (country,),
+    ).fetchall()
+    conn.close()
+    return [Participant(*r) for r in rows]
+
+
+def is_blacklisted(user_id: int, country: str) -> bool:
+    conn = _conn()
+    row = conn.execute(
+        "SELECT 1 FROM blacklist WHERE user_id=? AND country=?", (user_id, country)
+    ).fetchone()
+    conn.close()
+    return row is not None
