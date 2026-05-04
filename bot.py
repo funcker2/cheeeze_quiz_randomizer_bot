@@ -379,12 +379,15 @@ async def _show_main_menu(chat_id: int, message_id: int | None = None, user_id: 
     country = cfg.country_by_code(country_code) if country_code else None
     country_label = country.label if country else "?"
     cd = _cooldown(country_code)
+    bl_count = len(db.get_blacklist(country_code)) if country_code else 0
+    bl_label = f"🚫 Чёрный список ({bl_count})" if bl_count else "🚫 Чёрный список"
     buttons = [
         [InlineKeyboardButton(text="🎮 Мои игры", callback_data="show_games")],
         [InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")],
         [InlineKeyboardButton(text=f"⏳ Кулдаун: {cd} мин", callback_data="show_cooldown")],
         [InlineKeyboardButton(text="🏆 Победители на кулдауне", callback_data="show_winners")],
         [InlineKeyboardButton(text="🔄 Сброс кулдауна", callback_data="reset_cooldowns")],
+        [InlineKeyboardButton(text=bl_label, callback_data="show_blacklist")],
         [InlineKeyboardButton(text=f"🌍 {country_label}", callback_data="switch_country")],
     ]
     text = f"🎲 Бот-рандомайзер — {country_label}"
@@ -1002,6 +1005,34 @@ async def on_reset_cooldowns(cb: CallbackQuery) -> None:
         return
     n = db.clear_winners()
     await cb.answer(f"✅ Кулдауны сброшены ({n} записей)", show_alert=True)
+
+
+@router.callback_query(F.data == "show_blacklist")
+async def on_show_blacklist(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    country = _get_country(cb.from_user.id)
+    if not country:
+        await cb.answer("Сначала выбери страну: /start")
+        return
+    entries = db.get_blacklist(country)
+    country_obj = cfg.country_by_code(country)
+    country_label = country_obj.label if country_obj else country
+    if not entries:
+        await cb.answer(f"🚫 Чёрный список ({country_label}) пуст.", show_alert=True)
+        return
+    kb = _kb_blacklist(entries, country, 0)
+    try:
+        await cb.message.edit_text(
+            f"🚫 Чёрный список ({country_label}) — {len(entries)} чел.:",
+            reply_markup=kb,
+        )
+    except Exception:
+        await cb.message.answer(
+            f"🚫 Чёрный список ({country_label}) — {len(entries)} чел.:",
+            reply_markup=kb,
+        )
+    await cb.answer()
 
 
 @cmd_router.message(Command("cancel"), StateFilter("*"))
@@ -2239,6 +2270,7 @@ def _kb_blacklist(entries: list[db.Participant], country: str, page: int) -> Inl
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="▶️", callback_data=f"bl_page:{page + 1}"))
         buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="go_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
