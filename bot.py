@@ -57,6 +57,10 @@ class PublishGiveaway(StatesGroup):
     waiting_custom_time = State()
 
 
+class BlacklistEdit(StatesGroup):
+    waiting_user_id = State()
+
+
 def is_admin(user_id: int) -> bool:
     return cfg.is_admin(user_id)
 
@@ -1019,7 +1023,15 @@ async def on_show_blacklist(cb: CallbackQuery) -> None:
     country_obj = cfg.country_by_code(country)
     country_label = country_obj.label if country_obj else country
     if not entries:
-        await cb.answer(f"🚫 Чёрный список ({country_label}) пуст.", show_alert=True)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить по ID", callback_data=f"bl_add:{country}")],
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="go_menu")],
+        ])
+        try:
+            await cb.message.edit_text(f"🚫 Чёрный список ({country_label}) пуст.", reply_markup=kb)
+        except Exception:
+            await cb.message.answer(f"🚫 Чёрный список ({country_label}) пуст.", reply_markup=kb)
+        await cb.answer()
         return
     kb = _kb_blacklist(entries, country, 0)
     try:
@@ -2270,6 +2282,7 @@ def _kb_blacklist(entries: list[db.Participant], country: str, page: int) -> Inl
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="▶️", callback_data=f"bl_page:{page + 1}"))
         buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="➕ Добавить по ID", callback_data=f"bl_add:{country}")])
     buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="go_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -2323,7 +2336,11 @@ async def on_unban(cb: CallbackQuery) -> None:
     country_obj = cfg.country_by_code(country)
     country_label = country_obj.label if country_obj else country
     if not entries:
-        await cb.message.edit_text(f"🚫 Чёрный список ({country_label}) пуст.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить по ID", callback_data=f"bl_add:{country}")],
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="go_menu")],
+        ])
+        await cb.message.edit_text(f"🚫 Чёрный список ({country_label}) пуст.", reply_markup=kb)
         await cb.answer("✅ Разбанен.")
         return
     kb = _kb_blacklist(entries, country, 0)
@@ -2332,6 +2349,85 @@ async def on_unban(cb: CallbackQuery) -> None:
         reply_markup=kb,
     )
     await cb.answer("✅ Разбанен.")
+
+
+# ── bl_add: manually add user to blacklist by ID ─────────
+
+@router.callback_query(F.data.startswith("bl_add:"))
+async def on_bl_add_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    country = cb.data.split(":", 1)[1]
+    await state.set_state(BlacklistEdit.waiting_user_id)
+    await state.update_data(bl_country=country, bl_message_id=cb.message.message_id)
+    country_obj = cfg.country_by_code(country)
+    country_label = country_obj.label if country_obj else country
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"bl_add_cancel:{country}")],
+    ])
+    try:
+        await cb.message.edit_text(
+            f"🚫 Чёрный список ({country_label})\n\nВведи Telegram user ID для бана:",
+            reply_markup=kb,
+        )
+    except Exception:
+        await cb.message.answer(
+            f"🚫 Чёрный список ({country_label})\n\nВведи Telegram user ID для бана:",
+            reply_markup=kb,
+        )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("bl_add_cancel:"))
+async def on_bl_add_cancel(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    await state.clear()
+    country = cb.data.split(":", 1)[1]
+    entries = db.get_blacklist(country)
+    country_obj = cfg.country_by_code(country)
+    country_label = country_obj.label if country_obj else country
+    if not entries:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить по ID", callback_data=f"bl_add:{country}")],
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="go_menu")],
+        ])
+        await cb.message.edit_text(f"🚫 Чёрный список ({country_label}) пуст.", reply_markup=kb)
+    else:
+        kb = _kb_blacklist(entries, country, 0)
+        await cb.message.edit_text(
+            f"🚫 Чёрный список ({country_label}) — {len(entries)} чел.:",
+            reply_markup=kb,
+        )
+    await cb.answer()
+
+
+@router.message(StateFilter(BlacklistEdit.waiting_user_id))
+async def on_bl_add_id(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    country = data.get("bl_country", "")
+    raw = message.text.strip() if message.text else ""
+    try:
+        target_id = int(raw)
+    except ValueError:
+        await message.answer("❌ Введи числовой Telegram user ID.")
+        return
+
+    await state.clear()
+    await message.delete()
+
+    added = db.add_to_blacklist(target_id, country, None, str(target_id))
+    country_obj = cfg.country_by_code(country)
+    country_label = country_obj.label if country_obj else country
+    entries = db.get_blacklist(country)
+    kb = _kb_blacklist(entries, country, 0)
+    status = "добавлен" if added else "уже в списке"
+    await message.answer(
+        f"🚫 {target_id} {status}.\n\nЧёрный список ({country_label}) — {len(entries)} чел.:",
+        reply_markup=kb,
+    )
 
 
 # ── ban_win: blacklist winner from draw screen + reroll ───
