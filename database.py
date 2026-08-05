@@ -40,6 +40,7 @@ class Giveaway:
     admin_chat_id: int | None
     country: str | None
     source_id: int | None
+    archived_at: str | None
 
 
 @dataclass
@@ -51,7 +52,8 @@ class Participant:
 
 _GIVEAWAY_COLS = (
     "id, game_id, name, prize_text, prize_entities, photo_id, winner_count, "
-    "status, created_at, channel_message_id, channel_id, draw_deadline, admin_chat_id, country, source_id"
+    "status, created_at, channel_message_id, channel_id, draw_deadline, admin_chat_id, country, source_id, "
+    "archived_at"
 )
 
 
@@ -130,6 +132,8 @@ def init_db() -> None:
         conn.execute("ALTER TABLE giveaways ADD COLUMN country TEXT")
     if "source_id" not in cols:
         conn.execute("ALTER TABLE giveaways ADD COLUMN source_id INTEGER")
+    if "archived_at" not in cols:
+        conn.execute("ALTER TABLE giveaways ADD COLUMN archived_at TEXT")
 
     game_cols = {r[1] for r in conn.execute("PRAGMA table_info(games)").fetchall()}
     if "country" not in game_cols:
@@ -268,19 +272,62 @@ def get_queued(game_id: int | None = None) -> list[Giveaway]:
 
 
 def get_free_giveaways(country: str | None = None) -> list[Giveaway]:
-    """Giveaways not assigned to any game (reusable library)."""
+    """Giveaways not assigned to any game and not archived (reusable library)."""
     conn = _conn()
     if country:
         rows = conn.execute(
-            f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE game_id IS NULL AND status IN ('queued','finished') AND country=? ORDER BY id",
+            f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE game_id IS NULL AND status IN ('queued','finished') "
+            "AND archived_at IS NULL AND country=? ORDER BY id",
             (country,),
         ).fetchall()
     else:
         rows = conn.execute(
-            f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE game_id IS NULL AND status IN ('queued','finished') ORDER BY id"
+            f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE game_id IS NULL AND status IN ('queued','finished') "
+            "AND archived_at IS NULL ORDER BY id"
         ).fetchall()
     conn.close()
     return [Giveaway(*r) for r in rows]
+
+
+def get_archived_giveaways(country: str | None = None) -> list[Giveaway]:
+    """Library giveaways moved to the archive, newest first."""
+    conn = _conn()
+    if country:
+        rows = conn.execute(
+            f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE game_id IS NULL AND status IN ('queued','finished') "
+            "AND archived_at IS NOT NULL AND country=? ORDER BY archived_at DESC",
+            (country,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE game_id IS NULL AND status IN ('queued','finished') "
+            "AND archived_at IS NOT NULL ORDER BY archived_at DESC"
+        ).fetchall()
+    conn.close()
+    return [Giveaway(*r) for r in rows]
+
+
+def archive_giveaway(gid: int) -> bool:
+    """Move a library giveaway to the archive. Copies bound to a game cannot be archived."""
+    conn = _conn()
+    cur = conn.execute(
+        "UPDATE giveaways SET archived_at=? WHERE id=? AND game_id IS NULL AND archived_at IS NULL",
+        (_now(), gid),
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def unarchive_giveaway(gid: int) -> bool:
+    """Return an archived giveaway to the library, keeping its status."""
+    conn = _conn()
+    cur = conn.execute(
+        "UPDATE giveaways SET archived_at=NULL WHERE id=? AND archived_at IS NOT NULL", (gid,)
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
 
 
 def assign_to_game(gid: int, game_id: int) -> bool:
