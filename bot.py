@@ -613,12 +613,15 @@ async def on_delete_game(cb: CallbackQuery) -> None:
 async def _show_library(chat_id: int, message_id: int | None = None, page: int = 0, user_id: int | None = None) -> None:
     country = _get_country(user_id if user_id is not None else chat_id)
     free = db.get_free_giveaways(country=country)
+    archived_count = len(db.get_archived_giveaways(country=country))
+    archive_row = [InlineKeyboardButton(text=f"🗄 Архив ({archived_count})", callback_data="show_archive")]
     if not free:
         text = "📚 Библиотека пуста."
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить розыгрыш", callback_data="go_new_lib")],
-            [InlineKeyboardButton(text="◀️ Меню", callback_data="go_menu")],
-        ])
+        rows = [[InlineKeyboardButton(text="➕ Добавить розыгрыш", callback_data="go_new_lib")]]
+        if archived_count:
+            rows.append(archive_row)
+        rows.append([InlineKeyboardButton(text="◀️ Меню", callback_data="go_menu")])
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
         if message_id:
             try:
                 await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
@@ -648,6 +651,8 @@ async def _show_library(chat_id: int, message_id: int | None = None, page: int =
             nav.append(InlineKeyboardButton(text="▶️", callback_data=f"libpage:{page + 1}"))
         buttons.append(nav)
     buttons.append([InlineKeyboardButton(text="➕ Добавить розыгрыш", callback_data="go_new_lib")])
+    if archived_count:
+        buttons.append(archive_row)
     buttons.append([InlineKeyboardButton(text="◀️ Меню", callback_data="go_menu")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -675,6 +680,60 @@ async def on_lib_page(cb: CallbackQuery) -> None:
         return
     page = int(cb.data.split(":")[1])
     await _show_library(cb.message.chat.id, cb.message.message_id, page, user_id=cb.from_user.id)
+    await cb.answer()
+
+
+# ── Archive (giveaways moved out of the library) ────────
+
+async def _show_archive(chat_id: int, message_id: int | None = None, page: int = 0, user_id: int | None = None) -> None:
+    country = _get_country(user_id if user_id is not None else chat_id)
+    archived = db.get_archived_giveaways(country=country)
+    buttons: list[list[InlineKeyboardButton]] = []
+    if not archived:
+        text = "🗄 Архив пуст."
+    else:
+        page_items, total_pages = _paginate(archived, page)
+        for g in page_items:
+            label = _giveaway_label(g)
+            icon = "🖼" if g.photo_id else "📝"
+            buttons.append([
+                InlineKeyboardButton(text=f"{icon} #{g.id}: {label}", callback_data=f"arcview:{g.id}"),
+            ])
+        if total_pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton(text="◀️", callback_data=f"arcpage:{page - 1}"))
+            nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+            if page < total_pages - 1:
+                nav.append(InlineKeyboardButton(text="▶️", callback_data=f"arcpage:{page + 1}"))
+            buttons.append(nav)
+        text = f"🗄 Архив розыгрышей ({len(archived)}):"
+    buttons.append([InlineKeyboardButton(text="◀️ Назад в библиотеку", callback_data="show_library")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if message_id:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "show_archive")
+async def on_show_archive(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    await _show_archive(cb.message.chat.id, cb.message.message_id, user_id=cb.from_user.id)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("arcpage:"))
+async def on_archive_page(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    page = int(cb.data.split(":")[1])
+    await _show_archive(cb.message.chat.id, cb.message.message_id, page, user_id=cb.from_user.id)
     await cb.answer()
 
 
@@ -756,6 +815,10 @@ async def on_library_pick(cb: CallbackQuery) -> None:
         return
     parts = cb.data.split(":")
     game_id, gid = int(parts[1]), int(parts[2])
+    src = db.get_giveaway(gid)
+    if not src or src.archived_at:
+        await cb.answer("Розыгрыш в архиве — сначала верни его в библиотеку")
+        return
     db.copy_giveaway(gid, game_id)
     game = db.get_game(game_id)
     if game:
@@ -769,6 +832,10 @@ async def on_lib_to_game(cb: CallbackQuery) -> None:
         return
     parts = cb.data.split(":")
     gid, game_id = int(parts[1]), int(parts[2])
+    src = db.get_giveaway(gid)
+    if not src or src.archived_at:
+        await cb.answer("Розыгрыш в архиве — сначала верни его в библиотеку")
+        return
     db.copy_giveaway(gid, game_id)
     game = db.get_game(game_id)
     if game:
@@ -1268,8 +1335,10 @@ async def on_view_giveaway(cb: CallbackQuery) -> None:
             InlineKeyboardButton(text="🖼 Заменить фото", callback_data=f"edph:{gid}"),
             InlineKeyboardButton(text="✏️ Заменить текст", callback_data=f"edtx:{gid}"),
         ],
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{gid}")],
     ]
+    if not g.game_id:
+        edit_buttons.append([InlineKeyboardButton(text="🗄 Перенести в архив", callback_data=f"arch:{gid}")])
+    edit_buttons.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{gid}")])
     if g.game_id:
         edit_buttons.append([InlineKeyboardButton(text="🎮 Назад к игре", callback_data=f"game:{g.game_id}")])
     else:
@@ -1286,6 +1355,66 @@ async def on_view_giveaway(cb: CallbackQuery) -> None:
         reply_markup=InlineKeyboardMarkup(inline_keyboard=top_buttons + edit_buttons),
     )
     await cb.answer()
+
+
+# ── View / act on archived giveaway ─────────────────────
+
+@router.callback_query(F.data.startswith("arcview:"))
+async def on_archive_view(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    g = db.get_giveaway(gid)
+    if not g or not g.archived_at:
+        await _show_archive(cb.message.chat.id, cb.message.message_id, user_id=cb.from_user.id)
+        await cb.answer("Розыгрыш не в архиве")
+        return
+
+    entities = _deserialize_entities(g.prize_entities)
+    if g.photo_id:
+        await cb.message.answer_photo(
+            photo=g.photo_id,
+            caption=g.prize_text,
+            caption_entities=entities,
+        )
+    else:
+        await bot.send_message(
+            chat_id=cb.message.chat.id,
+            text=g.prize_text,
+            entities=entities,
+        )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Вернуть в библиотеку", callback_data=f"unarch:{gid}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{gid}")],
+        [InlineKeyboardButton(text="◀️ Назад в архив", callback_data="show_archive")],
+    ])
+    await cb.message.answer(f"🗄 Розыгрыш #{g.id} — в архиве", reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("arch:"))
+async def on_archive(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    if db.archive_giveaway(gid):
+        await _show_library(cb.message.chat.id, cb.message.message_id, user_id=cb.from_user.id)
+        await cb.answer(f"#{gid} перенесён в архив")
+    else:
+        await cb.answer("Не удалось перенести в архив")
+
+
+@router.callback_query(F.data.startswith("unarch:"))
+async def on_unarchive(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    if db.unarchive_giveaway(gid):
+        await _show_library(cb.message.chat.id, cb.message.message_id, user_id=cb.from_user.id)
+        await cb.answer(f"#{gid} возвращён в библиотеку")
+    else:
+        await cb.answer("Не удалось вернуть")
 
 
 # ── Edit giveaway ────────────────────────────────────────
