@@ -41,6 +41,7 @@ class Giveaway:
     country: str | None
     source_id: int | None
     archived_at: str | None
+    sponsor_instagram: str | None
 
 
 @dataclass
@@ -53,7 +54,7 @@ class Participant:
 _GIVEAWAY_COLS = (
     "id, game_id, name, prize_text, prize_entities, photo_id, winner_count, "
     "status, created_at, channel_message_id, channel_id, draw_deadline, admin_chat_id, country, source_id, "
-    "archived_at"
+    "archived_at, sponsor_instagram"
 )
 
 
@@ -134,6 +135,8 @@ def init_db() -> None:
         conn.execute("ALTER TABLE giveaways ADD COLUMN source_id INTEGER")
     if "archived_at" not in cols:
         conn.execute("ALTER TABLE giveaways ADD COLUMN archived_at TEXT")
+    if "sponsor_instagram" not in cols:
+        conn.execute("ALTER TABLE giveaways ADD COLUMN sponsor_instagram TEXT")
 
     game_cols = {r[1] for r in conn.execute("PRAGMA table_info(games)").fetchall()}
     if "country" not in game_cols:
@@ -243,12 +246,13 @@ def add_giveaway(
     game_id: int | None = None,
     name: str | None = None,
     country: str | None = None,
+    sponsor_instagram: str | None = None,
 ) -> int:
     conn = _conn()
     cur = conn.execute(
-        "INSERT INTO giveaways (game_id, name, prize_text, prize_entities, photo_id, winner_count, created_at, country) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (game_id, name, prize_text, prize_entities, photo_id, winner_count, _now(), country),
+        "INSERT INTO giveaways (game_id, name, prize_text, prize_entities, photo_id, winner_count, created_at, "
+        "country, sponsor_instagram) VALUES (?,?,?,?,?,?,?,?,?)",
+        (game_id, name, prize_text, prize_entities, photo_id, winner_count, _now(), country, sponsor_instagram),
     )
     gid = cur.lastrowid
     conn.commit()
@@ -363,10 +367,10 @@ def copy_giveaway(source_id: int, game_id: int) -> int:
 
     cur = conn.execute(
         "INSERT INTO giveaways "
-        "(game_id, name, prize_text, prize_entities, photo_id, winner_count, created_at, country, source_id) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
+        "(game_id, name, prize_text, prize_entities, photo_id, winner_count, created_at, country, source_id, "
+        "sponsor_instagram) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (game_id, copy_name, g.prize_text, g.prize_entities, g.photo_id,
-         g.winner_count, _now(), g.country, source_id),
+         g.winner_count, _now(), g.country, source_id, g.sponsor_instagram),
     )
     new_id = cur.lastrowid
     conn.commit()
@@ -446,6 +450,8 @@ def update_giveaway(
     photo_id: str | None = None,
     clear_photo: bool = False,
     name: str | None = None,
+    sponsor_instagram: str | None = None,
+    clear_sponsor: bool = False,
 ) -> bool:
     conn = _conn()
     fields: list[str] = []
@@ -453,6 +459,11 @@ def update_giveaway(
     if name is not None:
         fields.append("name=?")
         values.append(name)
+    if clear_sponsor:
+        fields.append("sponsor_instagram=NULL")
+    elif sponsor_instagram is not None:
+        fields.append("sponsor_instagram=?")
+        values.append(sponsor_instagram)
     if prize_text is not None:
         fields.append("prize_text=?")
         values.append(prize_text)
