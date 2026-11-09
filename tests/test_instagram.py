@@ -72,23 +72,38 @@ def test_utf16_len_counts_emoji_as_two():
 
 
 def test_render_without_sponsor_is_identity():
-    assert render_with_sponsor("Приз 🎁", None) == ("Приз 🎁", None)
+    assert render_with_sponsor("Приз 🎁", None) == ("Приз 🎁", [])
 
 
-def test_render_entity_points_at_handle():
-    prize = "🎁 Разыгрываем <b>сертификат</b> 🍰"
-    text, ent = render_with_sponsor(prize, "sunny_cafe.bg")
-    assert text.endswith("\n\nСпонсор: 📸 Instagram @sunny_cafe.bg")
+def _covered(text, ent):
     raw = text.encode("utf-16-le")
-    covered = raw[ent["offset"] * 2:(ent["offset"] + ent["length"]) * 2].decode("utf-16-le")
-    assert covered == "Instagram @sunny_cafe.bg"
-    assert ent["type"] == "text_link"
-    assert ent["url"] == "https://www.instagram.com/sunny_cafe.bg/"
+    return raw[ent["offset"] * 2:(ent["offset"] + ent["length"]) * 2].decode("utf-16-le")
+
+
+def test_render_entities_point_at_emoji_and_handle():
+    prize = "🎁 Разыгрываем <b>сертификат</b> 🍰"
+    text, ents = render_with_sponsor(prize, "odessa.shaurmama")
+    assert text.endswith("\n\n🗯 @odessa.shaurmama")
+    emoji, link = ents
+    assert emoji["type"] == "custom_emoji"
+    assert emoji["custom_emoji_id"] == "5888682921987937842"
+    assert _covered(text, emoji) == "🗯"
+    assert link["type"] == "text_link"
+    assert _covered(text, link) == "@odessa.shaurmama"
+    assert link["url"] == "https://www.instagram.com/odessa.shaurmama/"
+
+
+def test_sponsor_html():
+    from instagram import sponsor_html
+    assert sponsor_html("odessa.shaurmama") == (
+        '<tg-emoji emoji-id="5888682921987937842">🗯</tg-emoji> '
+        '<a href="https://www.instagram.com/odessa.shaurmama/">@odessa.shaurmama</a>'
+    )
 
 
 def test_overflow_caption():
     handle = "sunny_cafe.bg"
-    line = len("\n\nСпонсор: 📸 Instagram @sunny_cafe.bg") + 1  # emoji = 2 UTF-16 units
+    line = len("\n\n🗯 @sunny_cafe.bg") + 1  # emoji = 2 UTF-16 units
     assert overflow("x" * (1024 - line), handle, has_photo=True) == 0
     assert overflow("x" * (1024 - line + 17), handle, has_photo=True) == 17
     assert overflow("x" * 2000, handle, has_photo=False) == 0

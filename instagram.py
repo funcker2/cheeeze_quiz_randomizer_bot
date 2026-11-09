@@ -3,6 +3,7 @@
 Pure functions (no aiogram) so they can be unit-tested without the bot.
 """
 import re
+from html import escape
 from urllib.parse import urlparse
 
 _HANDLE_RE = re.compile(r"^[a-z0-9._]{1,30}$")
@@ -10,7 +11,10 @@ _HOSTS = {"instagram.com", "www.instagram.com", "m.instagram.com"}
 # First path segments that are not accounts (posts, reels, stories, service pages).
 RESERVED = {"p", "reel", "reels", "stories", "explore", "tv", "accounts", "direct"}
 
-SPONSOR_PREFIX = "Спонсор: 📸 "
+# Instagram logo custom emoji. Shown only if the bot may send custom emoji
+# (bot owns a Fragment username); otherwise Telegram shows the fallback 🗯.
+IG_EMOJI_ID = "5888682921987937842"
+IG_EMOJI_FALLBACK = "🗯"
 CAPTION_LIMIT = 1024
 TEXT_LIMIT = 4096
 
@@ -64,28 +68,48 @@ def utf16_len(s: str) -> int:
 
 
 def sponsor_label(handle: str) -> str:
-    """Visible link text: names the network so readers know where the link leads."""
-    return f"Instagram @{handle}"
+    """Visible link text."""
+    return f"@{handle}"
 
 
-def render_with_sponsor(prize_text: str, handle: str | None) -> tuple[str, dict | None]:
-    """Append the sponsor line ("Спонсор: 📸 Instagram @handle") to the prize text.
+def sponsor_html(handle: str, custom_emoji: bool = True) -> str:
+    """Sponsor line for HTML messages: Instagram emoji + linked @handle."""
+    url = escape(instagram_url(handle), quote=True)
+    icon = (
+        f'<tg-emoji emoji-id="{IG_EMOJI_ID}">{IG_EMOJI_FALLBACK}</tg-emoji>'
+        if custom_emoji else IG_EMOJI_FALLBACK
+    )
+    return f'{icon} <a href="{url}">{escape(sponsor_label(handle))}</a>'
 
-    Returns (text, link_entity) where link_entity is a dict for a Telegram
-    text_link MessageEntity covering "Instagram @handle", or None when there is no sponsor.
+
+def render_with_sponsor(prize_text: str, handle: str | None) -> tuple[str, list[dict]]:
+    """Append the sponsor line ("🗯 @handle", 🗯 = Instagram custom emoji) to the prize text.
+
+    Returns (text, extra_entities): a custom_emoji entity over the emoji and a
+    text_link entity over "@handle"; empty list when there is no sponsor.
     Existing entities of prize_text stay valid because the line is appended at the end.
     """
     if not handle:
-        return prize_text, None
-    head = f"{prize_text}\n\n{SPONSOR_PREFIX}"
+        return prize_text, []
+    head = f"{prize_text}\n\n"
     label = sponsor_label(handle)
-    entity = {
-        "type": "text_link",
-        "offset": utf16_len(head),
-        "length": utf16_len(label),
-        "url": instagram_url(handle),
-    }
-    return head + label, entity
+    emoji_at = utf16_len(head)
+    link_at = emoji_at + utf16_len(IG_EMOJI_FALLBACK) + 1
+    entities = [
+        {
+            "type": "custom_emoji",
+            "offset": emoji_at,
+            "length": utf16_len(IG_EMOJI_FALLBACK),
+            "custom_emoji_id": IG_EMOJI_ID,
+        },
+        {
+            "type": "text_link",
+            "offset": link_at,
+            "length": utf16_len(label),
+            "url": instagram_url(handle),
+        },
+    ]
+    return f"{head}{IG_EMOJI_FALLBACK} {label}", entities
 
 
 def overflow(prize_text: str, handle: str | None, has_photo: bool) -> int:
