@@ -14,11 +14,13 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     Message,
     MessageEntity,
 )
 
 import database as db
+import instagram as ig
 from config import Config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -45,12 +47,14 @@ class NewGiveaway(StatesGroup):
     waiting_name = State()
     waiting_content = State()
     waiting_text_for_photo = State()
+    waiting_sponsor = State()
 
 
 class EditGiveaway(StatesGroup):
     waiting_name = State()
     waiting_photo = State()
     waiting_text = State()
+    waiting_sponsor = State()
 
 
 class PublishGiveaway(StatesGroup):
@@ -132,11 +136,18 @@ async def _send_result_to_channel(g: db.Giveaway, winners: list[db.Participant])
         f"{_format_winners_html(winners)}\n\n"
         f"Приз: {html_module.escape(g.prize_text)}"
     )
+    preview = None
+    if g.sponsor_instagram:
+        url = html_module.escape(ig.instagram_url(g.sponsor_instagram), quote=True)
+        label = html_module.escape(ig.sponsor_label(g.sponsor_instagram))
+        announce += f'\nСпонсор приза: 📸 <a href="{url}">{label}</a>'
+        preview = LinkPreviewOptions(is_disabled=True)
     await bot.send_message(
         chat_id=g.channel_id,
         text=announce,
         parse_mode="HTML",
         reply_to_message_id=g.channel_message_id,
+        link_preview_options=preview,
     )
 
 
@@ -153,6 +164,63 @@ def _deserialize_entities(data: str | None) -> list[MessageEntity] | None:
         return [MessageEntity.model_validate(e) for e in json.loads(data)]
     except Exception:
         return None
+
+
+# ── Sponsor (Instagram) ──────────────────────────────────
+
+def _render_post(g: db.Giveaway) -> tuple[str, list[MessageEntity] | None]:
+    """Prize text + sponsor line, as sent to the channel. DB text is never modified."""
+    entities = _deserialize_entities(g.prize_entities) or []
+    text, link = ig.render_with_sponsor(g.prize_text, g.sponsor_instagram)
+    if link:
+        entities = entities + [MessageEntity.model_validate(link)]
+    return text, entities or None
+
+
+def _post_link_preview(g: db.Giveaway) -> LinkPreviewOptions | None:
+    """Disable the Instagram preview card unless the admin's own text already has a link."""
+    if not g.sponsor_instagram:
+        return None
+    own = _deserialize_entities(g.prize_entities) or []
+    if any(e.type in ("url", "text_link") for e in own):
+        return None
+    return LinkPreviewOptions(is_disabled=True)
+
+
+def _sponsor_line(handle: str | None) -> str:
+    return f"📸 Спонсор: {ig.sponsor_label(handle)}" if handle else ""
+
+
+_SPONSOR_SKIP_WORDS = {"-", "нет", "no", "skip"}
+
+
+def _parse_sponsor_input(text: str) -> tuple[str | None, str | None]:
+    """Return (handle, error_message). Both None means the admin skipped."""
+    s = (text or "").strip()
+    if s.lower() in _SPONSOR_SKIP_WORDS:
+        return None, None
+    try:
+        handle = ig.parse_instagram(s)
+    except ig.NotAnAccount:
+        return None, (
+            "Это ссылка на пост, а не на аккаунт. Пришли @handle или ссылку вида "
+            "instagram.com/handle. /cancel — отмена."
+        )
+    if not handle:
+        return None, (
+            "Это не похоже на Instagram-аккаунт. Пришли @handle или ссылку вида "
+            "instagram.com/handle. /cancel — отмена."
+        )
+    return handle, None
+
+
+def _overflow_message(over: int, has_photo: bool) -> str:
+    limit = ig.CAPTION_LIMIT if has_photo else ig.TEXT_LIMIT
+    kind = "подпись к фото" if has_photo else "текст поста"
+    return (
+        f"Со спонсором {kind} станет длиннее лимита Telegram ({limit}). "
+        f"Сократи текст на {over} симв. («✏️ Заменить текст») или обойдись без спонсора."
+    )
 
 
 # ── Keyboards ────────────────────────────────────────────
@@ -920,7 +988,7 @@ async def on_content_photo(message: Message, state: FSMContext) -> None:
             prize_text=message.caption,
             prize_entities=entities_json,
         )
-        await _save_giveaway(message, state)
+        await _ask_sponsor(message, state)
     else:
         await state.update_data(photo_id=photo_id)
         await message.answer("✅ Фото получено. Теперь отправь описание приза:")
@@ -937,7 +1005,7 @@ async def on_content_text(message: Message, state: FSMContext) -> None:
         prize_text=message.text,
         prize_entities=entities_json,
     )
-    await _save_giveaway(message, state)
+    await _ask_sponsor(message, state)
 
 
 @router.message(NewGiveaway.waiting_content)
@@ -953,7 +1021,7 @@ async def on_text_for_photo(message: Message, state: FSMContext) -> None:
         return
     entities_json = _serialize_entities(message.entities)
     await state.update_data(prize_text=message.text, prize_entities=entities_json)
-    await _save_giveaway(message, state)
+    await _ask_sponsor(message, state)
 
 
 @router.message(NewGiveaway.waiting_text_for_photo)
@@ -963,10 +1031,69 @@ async def on_text_for_photo_invalid(message: Message) -> None:
     await message.answer("Нужен текст. Отправь описание приза:")
 
 
-async def _save_giveaway(message: Message, state: FSMContext) -> None:
+_KB_SPONSOR_SKIP = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="⏭ Без спонсора", callback_data="spn_skip")],
+])
+
+
+async def _ask_sponsor(message: Message, state: FSMContext) -> None:
+    await state.set_state(NewGiveaway.waiting_sponsor)
+    await message.answer(
+        "📸 Чей это приз? Пришли Instagram спонсора:\n"
+        "@handle или ссылку instagram.com/handle\n\n"
+        "Нет спонсора — жми кнопку или отправь «-».",
+        reply_markup=_KB_SPONSOR_SKIP,
+    )
+
+
+@router.message(NewGiveaway.waiting_sponsor, F.text)
+async def on_sponsor_text(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    handle, error = _parse_sponsor_input(message.text)
+    if error:
+        await message.answer(error, reply_markup=_KB_SPONSOR_SKIP)
+        return
+    if handle:
+        data = await state.get_data()
+        has_photo = bool(data.get("photo_id"))
+        over = ig.overflow(data["prize_text"], handle, has_photo)
+        if over:
+            await message.answer(_overflow_message(over, has_photo), reply_markup=_KB_SPONSOR_SKIP)
+            return
+    await state.update_data(sponsor_instagram=handle)
+    await _save_giveaway(message, state)
+
+
+@router.callback_query(NewGiveaway.waiting_sponsor, F.data == "spn_skip")
+async def on_sponsor_skip(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    await state.update_data(sponsor_instagram=None)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _save_giveaway(cb.message, state, user_id=cb.from_user.id)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "spn_skip")
+async def on_sponsor_skip_stale(cb: CallbackQuery) -> None:
+    await cb.answer("Этот шаг уже пройден")
+
+
+@router.message(NewGiveaway.waiting_sponsor)
+async def on_sponsor_invalid(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Пришли @handle текстом или нажми «⏭ Без спонсора».", reply_markup=_KB_SPONSOR_SKIP)
+
+
+async def _save_giveaway(message: Message, state: FSMContext, user_id: int | None = None) -> None:
     data = await state.get_data()
     game_id = data.get("game_id")
-    country = _get_country(message.from_user.id)
+    country = _get_country(user_id if user_id is not None else message.from_user.id)
     if game_id:
         game_obj = db.get_game(game_id)
         if game_obj and game_obj.country:
@@ -978,8 +1105,10 @@ async def _save_giveaway(message: Message, state: FSMContext) -> None:
         game_id=game_id,
         name=data.get("giveaway_name"),
         country=country,
+        sponsor_instagram=data.get("sponsor_instagram"),
     )
     await state.clear()
+    sponsor = _sponsor_line(data.get("sponsor_instagram"))
 
     game = db.get_game(game_id) if game_id else None
 
@@ -1000,7 +1129,8 @@ async def _save_giveaway(message: Message, state: FSMContext) -> None:
         chat_id=message.chat.id,
         text=(
             f"✅ Розыгрыш #{gid} сохранён{game_label}\n"
-            f"{count_label}"
+            + (f"{sponsor}\n" if sponsor else "")
+            + f"{count_label}"
         ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
@@ -1200,7 +1330,8 @@ async def on_finished_giveaway(cb: CallbackQuery) -> None:
     text = (
         f"🔴 Розыгрыш #{gid}: {_giveaway_label(g)}\n"
         f"🎁 {g.prize_text[:80]}\n"
-        f"👥 Участников: {total}\n\n"
+        + (f"{_sponsor_line(g.sponsor_instagram)}\n" if g.sponsor_instagram else "")
+        + f"👥 Участников: {total}\n\n"
         f"{winners_text}"
     )
     buttons = [
@@ -1296,18 +1427,19 @@ async def on_view_giveaway(cb: CallbackQuery) -> None:
     if not g:
         await cb.answer("Не найден")
         return
-    entities = _deserialize_entities(g.prize_entities)
+    post_text, entities = _render_post(g)
     if g.photo_id:
         await cb.message.answer_photo(
             photo=g.photo_id,
-            caption=g.prize_text,
+            caption=post_text,
             caption_entities=entities,
         )
     else:
         await bot.send_message(
             chat_id=cb.message.chat.id,
-            text=g.prize_text,
+            text=post_text,
             entities=entities,
+            link_preview_options=_post_link_preview(g),
         )
 
     top_buttons: list[list[InlineKeyboardButton]] = []
@@ -1336,6 +1468,10 @@ async def on_view_giveaway(cb: CallbackQuery) -> None:
             InlineKeyboardButton(text="✏️ Заменить текст", callback_data=f"edtx:{gid}"),
         ],
     ]
+    sponsor_btn = f"📸 Спонсор: @{g.sponsor_instagram}" if g.sponsor_instagram else "📸 Спонсор: —"
+    edit_buttons.append([InlineKeyboardButton(text=sponsor_btn, callback_data=f"edsp:{gid}")])
+    if g.sponsor_instagram:
+        edit_buttons.append([InlineKeyboardButton(text="✖️ Убрать спонсора", callback_data=f"edsp_clr:{gid}")])
     if not g.game_id:
         edit_buttons.append([InlineKeyboardButton(text="🗄 Перенести в архив", callback_data=f"arch:{gid}")])
     edit_buttons.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{gid}")])
@@ -1345,6 +1481,8 @@ async def on_view_giveaway(cb: CallbackQuery) -> None:
         edit_buttons.append([InlineKeyboardButton(text="📚 Назад в библиотеку", callback_data="show_library")])
 
     title = f"🎁 Розыгрыш #{g.id}"
+    if g.sponsor_instagram:
+        title += f"\n{_sponsor_line(g.sponsor_instagram)}"
     if g.game_id:
         title += "\n\nОпубликовать или отредактировать:"
     else:
@@ -1370,18 +1508,19 @@ async def on_archive_view(cb: CallbackQuery) -> None:
         await cb.answer("Розыгрыш не в архиве")
         return
 
-    entities = _deserialize_entities(g.prize_entities)
+    post_text, entities = _render_post(g)
     if g.photo_id:
         await cb.message.answer_photo(
             photo=g.photo_id,
-            caption=g.prize_text,
+            caption=post_text,
             caption_entities=entities,
         )
     else:
         await bot.send_message(
             chat_id=cb.message.chat.id,
-            text=g.prize_text,
+            text=post_text,
             entities=entities,
+            link_preview_options=_post_link_preview(g),
         )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1498,6 +1637,12 @@ async def on_edit_photo_received(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     gid = data["edit_gid"]
     photo_id = message.photo[-1].file_id
+    cur = db.get_giveaway(gid)
+    if cur and cur.sponsor_instagram:
+        over = ig.overflow(cur.prize_text, cur.sponsor_instagram, has_photo=True)
+        if over:
+            await message.answer(_overflow_message(over, True) + " /cancel — отмена.")
+            return
     db.update_giveaway(gid, photo_id=photo_id)
     g = db.get_giveaway(gid)
     await state.clear()
@@ -1525,6 +1670,16 @@ async def on_edit_text_received(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     gid = data["edit_gid"]
+    cur = db.get_giveaway(gid)
+    if cur and cur.sponsor_instagram:
+        has_photo = bool(cur.photo_id)
+        over = ig.overflow(message.text, cur.sponsor_instagram, has_photo)
+        if over:
+            await message.answer(
+                f"Со строкой спонсора текст длиннее лимита Telegram на {over} симв. "
+                "Пришли текст короче. /cancel — отмена."
+            )
+            return
     entities_json = _serialize_entities(message.entities)
     db.update_giveaway(gid, prize_text=message.text, prize_entities=entities_json)
     g = db.get_giveaway(gid)
@@ -1545,6 +1700,82 @@ async def on_edit_text_invalid(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
     await message.answer("Отправь текст. /cancel — отмена.")
+
+
+def _after_edit_kb(gid: int, g: db.Giveaway | None) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(text="👁 Посмотреть", callback_data=f"view:{gid}")]]
+    if g and g.game_id:
+        buttons.append([InlineKeyboardButton(text="🎮 К игре", callback_data=f"game:{g.game_id}")])
+    else:
+        buttons.append([InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data.startswith("edsp:"))
+async def on_edit_sponsor(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    g = db.get_giveaway(gid)
+    if not g or g.status not in ("queued", "finished"):
+        await cb.answer("Розыгрыш недоступен")
+        return
+    await state.update_data(edit_gid=gid)
+    await state.set_state(EditGiveaway.waiting_sponsor)
+    current = f"\nСейчас: @{g.sponsor_instagram}" if g.sponsor_instagram else ""
+    await cb.message.edit_text(
+        f"📸 Пришли Instagram спонсора для розыгрыша #{gid}:\n"
+        f"@handle или ссылку instagram.com/handle{current}\n\n/cancel — отмена."
+    )
+    await cb.answer()
+
+
+@router.message(EditGiveaway.waiting_sponsor, F.text)
+async def on_edit_sponsor_received(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    gid = data["edit_gid"]
+    handle, error = _parse_sponsor_input(message.text)
+    if error:
+        await message.answer(error)
+        return
+    if not handle:
+        await message.answer("Чтобы убрать спонсора, нажми «✖️ Убрать спонсора» в карточке. /cancel — отмена.")
+        return
+    g = db.get_giveaway(gid)
+    if g:
+        over = ig.overflow(g.prize_text, handle, bool(g.photo_id))
+        if over:
+            await message.answer(_overflow_message(over, bool(g.photo_id)) + " /cancel — отмена.")
+            return
+    ok = db.update_giveaway(gid, sponsor_instagram=handle)
+    g = db.get_giveaway(gid)
+    await state.clear()
+    text = (
+        f"✅ Спонсор розыгрыша #{gid}: @{handle}" if ok
+        else f"Не удалось обновить розыгрыш #{gid} (уже опубликован?)"
+    )
+    await message.answer(text, reply_markup=_after_edit_kb(gid, g))
+
+
+@router.message(EditGiveaway.waiting_sponsor)
+async def on_edit_sponsor_invalid(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Пришли @handle текстом. /cancel — отмена.")
+
+
+@router.callback_query(F.data.startswith("edsp_clr:"))
+async def on_clear_sponsor(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        return
+    gid = int(cb.data.split(":")[1])
+    ok = db.update_giveaway(gid, clear_sponsor=True)
+    g = db.get_giveaway(gid)
+    text = f"✅ Спонсор у розыгрыша #{gid} убран." if ok else "Розыгрыш недоступен"
+    await cb.message.edit_text(text, reply_markup=_after_edit_kb(gid, g))
+    await cb.answer()
 
 
 # ── Delete giveaway ──────────────────────────────────────
@@ -1738,21 +1969,22 @@ async def _publish_giveaway(
     if not channel:
         await bot.send_message(chat_id, "Канал не найден для этой страны.")
         return
-    entities = _deserialize_entities(g.prize_entities)
+    post_text, entities = _render_post(g)
 
     if g.photo_id:
         msg = await bot.send_photo(
             chat_id=channel.id,
             photo=g.photo_id,
-            caption=g.prize_text,
+            caption=post_text,
             caption_entities=entities,
             reply_markup=_kb_participate(gid),
         )
     else:
         msg = await bot.send_message(
             chat_id=channel.id,
-            text=g.prize_text,
+            text=post_text,
             entities=entities,
+            link_preview_options=_post_link_preview(g),
             reply_markup=_kb_participate(gid),
         )
 
@@ -1777,7 +2009,8 @@ async def _publish_giveaway(
     text = (
         f"✅ Опубликовано в {channel.label}\n\n"
         f"🎁 {g.prize_text[:50]}\n"
-        f"{mode}\n"
+        + (f"{_sponsor_line(g.sponsor_instagram)}\n" if g.sponsor_instagram else "")
+        + f"{mode}\n"
         f"👥 Участников: {count}"
     )
 
