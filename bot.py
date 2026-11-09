@@ -6,6 +6,7 @@ import random
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -137,18 +138,30 @@ async def _send_result_to_channel(g: db.Giveaway, winners: list[db.Participant])
         f"Приз: {html_module.escape(g.prize_text)}"
     )
     preview = None
+    plain = announce
     if g.sponsor_instagram:
-        url = html_module.escape(ig.instagram_url(g.sponsor_instagram), quote=True)
-        label = html_module.escape(ig.sponsor_label(g.sponsor_instagram))
-        announce += f'\nСпонсор приза: 📸 <a href="{url}">{label}</a>'
+        announce += f"\n{ig.sponsor_html(g.sponsor_instagram)}"
+        plain += f"\n{ig.sponsor_html(g.sponsor_instagram, custom_emoji=False)}"
         preview = LinkPreviewOptions(is_disabled=True)
-    await bot.send_message(
-        chat_id=g.channel_id,
-        text=announce,
-        parse_mode="HTML",
-        reply_to_message_id=g.channel_message_id,
-        link_preview_options=preview,
-    )
+    try:
+        await bot.send_message(
+            chat_id=g.channel_id,
+            text=announce,
+            parse_mode="HTML",
+            reply_to_message_id=g.channel_message_id,
+            link_preview_options=preview,
+        )
+    except TelegramBadRequest as e:
+        if "emoji" not in str(e).lower() or plain == announce:
+            raise
+        log.warning("Custom emoji rejected, resending results without it: %s", e)
+        await bot.send_message(
+            chat_id=g.channel_id,
+            text=plain,
+            parse_mode="HTML",
+            reply_to_message_id=g.channel_message_id,
+            link_preview_options=preview,
+        )
 
 
 def _serialize_entities(entities: list[MessageEntity] | None) -> str | None:
@@ -171,10 +184,36 @@ def _deserialize_entities(data: str | None) -> list[MessageEntity] | None:
 def _render_post(g: db.Giveaway) -> tuple[str, list[MessageEntity] | None]:
     """Prize text + sponsor line, as sent to the channel. DB text is never modified."""
     entities = _deserialize_entities(g.prize_entities) or []
-    text, link = ig.render_with_sponsor(g.prize_text, g.sponsor_instagram)
-    if link:
-        entities = entities + [MessageEntity.model_validate(link)]
+    text, extra = ig.render_with_sponsor(g.prize_text, g.sponsor_instagram)
+    entities = entities + [MessageEntity.model_validate(e) for e in extra]
     return text, entities or None
+
+
+async def _send_post(chat_id: int | str, g: db.Giveaway, reply_markup: InlineKeyboardMarkup | None = None) -> Message:
+    """Send the giveaway post (photo or text) with the sponsor line.
+
+    If Telegram rejects the Instagram custom emoji (bot without a Fragment
+    username), resend with the plain fallback emoji instead of failing.
+    """
+    text, entities = _render_post(g)
+    for attempt in range(2):
+        try:
+            if g.photo_id:
+                return await bot.send_photo(
+                    chat_id=chat_id, photo=g.photo_id, caption=text,
+                    caption_entities=entities, reply_markup=reply_markup,
+                )
+            return await bot.send_message(
+                chat_id=chat_id, text=text, entities=entities,
+                link_preview_options=_post_link_preview(g), reply_markup=reply_markup,
+            )
+        except TelegramBadRequest as e:
+            has_custom = any(x.type == "custom_emoji" for x in entities or [])
+            if attempt or not has_custom or "emoji" not in str(e).lower():
+                raise
+            log.warning("Custom emoji rejected, resending post without it: %s", e)
+            entities = [x for x in entities if x.type != "custom_emoji"] or None
+    raise RuntimeError("unreachable")
 
 
 def _post_link_preview(g: db.Giveaway) -> LinkPreviewOptions | None:
@@ -1427,20 +1466,7 @@ async def on_view_giveaway(cb: CallbackQuery) -> None:
     if not g:
         await cb.answer("Не найден")
         return
-    post_text, entities = _render_post(g)
-    if g.photo_id:
-        await cb.message.answer_photo(
-            photo=g.photo_id,
-            caption=post_text,
-            caption_entities=entities,
-        )
-    else:
-        await bot.send_message(
-            chat_id=cb.message.chat.id,
-            text=post_text,
-            entities=entities,
-            link_preview_options=_post_link_preview(g),
-        )
+    await _send_post(cb.message.chat.id, g)
 
     top_buttons: list[list[InlineKeyboardButton]] = []
     country_code = g.country or _get_country(cb.from_user.id)
@@ -1508,20 +1534,7 @@ async def on_archive_view(cb: CallbackQuery) -> None:
         await cb.answer("Розыгрыш не в архиве")
         return
 
-    post_text, entities = _render_post(g)
-    if g.photo_id:
-        await cb.message.answer_photo(
-            photo=g.photo_id,
-            caption=post_text,
-            caption_entities=entities,
-        )
-    else:
-        await bot.send_message(
-            chat_id=cb.message.chat.id,
-            text=post_text,
-            entities=entities,
-            link_preview_options=_post_link_preview(g),
-        )
+    await _send_post(cb.message.chat.id, g)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="↩️ Вернуть в библиотеку", callback_data=f"unarch:{gid}")],
@@ -1969,24 +1982,7 @@ async def _publish_giveaway(
     if not channel:
         await bot.send_message(chat_id, "Канал не найден для этой страны.")
         return
-    post_text, entities = _render_post(g)
-
-    if g.photo_id:
-        msg = await bot.send_photo(
-            chat_id=channel.id,
-            photo=g.photo_id,
-            caption=post_text,
-            caption_entities=entities,
-            reply_markup=_kb_participate(gid),
-        )
-    else:
-        msg = await bot.send_message(
-            chat_id=channel.id,
-            text=post_text,
-            entities=entities,
-            link_preview_options=_post_link_preview(g),
-            reply_markup=_kb_participate(gid),
-        )
+    msg = await _send_post(channel.id, g, reply_markup=_kb_participate(gid))
 
     if minutes > 0:
         deadline = datetime.now(timezone.utc) + timedelta(minutes=minutes)
