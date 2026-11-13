@@ -274,7 +274,13 @@ def _overflow_message(over: int, has_photo: bool) -> str:
 # Animated custom emoji shown on the "Участвую!" button (gift, clover, bear, fireworks, …).
 # Admins set them with /icons (stored in settings); this list is only a code-level default.
 # One icon per giveaway, picked by id so it stays the same on counter refreshes.
-PARTICIPATE_ICONS: list[str] = []
+PARTICIPATE_ICONS: list[tuple[str, str]] = [
+    ("5449800250032143374", "🎁"),
+    ("5258040062028822951", "🍀"),
+    ("5206502842478638898", "🧸"),
+    ("5195100606250889609", "🎆"),
+    ("5461151367559141950", "🎉"),
+]
 _ICONS_SETTING = "participate_icons"
 # Set to True if Telegram rejects button icons once; then we stop sending them until restart.
 _button_icons_disabled = False
@@ -290,7 +296,7 @@ def _participate_icons() -> list[tuple[str, str]]:
                 return [(str(i[0]), str(i[1])) for i in items if isinstance(i, list) and len(i) == 2]
         except ValueError:
             pass
-    return [(i, "🎁") for i in PARTICIPATE_ICONS]
+    return list(PARTICIPATE_ICONS)
 
 
 def _participate_icon_ids() -> list[str]:
