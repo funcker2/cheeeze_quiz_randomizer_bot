@@ -132,16 +132,16 @@ async def _send_result_to_channel(g: db.Giveaway, winners: list[db.Participant])
     """Send winner announcement as a reply to the original giveaway post."""
     if not g.channel_id:
         return
+    # Sent as a reply to the giveaway post, so the prize is visible right above; don't repeat it.
     announce = (
-        f"🎉 Результаты розыгрыша:\n\n"
-        f"{_format_winners_html(winners)}\n\n"
-        f"Приз: {html_module.escape(g.prize_text)}"
+        f"🎉 Итоги розыгрыша\n\n"
+        f"{_format_winners_html(winners)}"
     )
     preview = None
     plain = announce
     if g.sponsor_instagram:
-        announce += f"\n{ig.sponsor_html(g.sponsor_instagram)}"
-        plain += f"\n{ig.sponsor_html(g.sponsor_instagram, custom_emoji=False)}"
+        announce += f"\n\n{ig.sponsor_html(g.sponsor_instagram)}"
+        plain += f"\n\n{ig.sponsor_html(g.sponsor_instagram, custom_emoji=False)}"
         preview = LinkPreviewOptions(is_disabled=True)
     try:
         await bot.send_message(
@@ -195,8 +195,9 @@ async def _send_post(chat_id: int | str, g: db.Giveaway, reply_markup: InlineKey
     If Telegram rejects the Instagram custom emoji (bot without a Fragment
     username), resend with the plain fallback emoji instead of failing.
     """
+    global _button_icons_disabled
     text, entities = _render_post(g)
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             if g.photo_id:
                 return await bot.send_photo(
@@ -208,11 +209,17 @@ async def _send_post(chat_id: int | str, g: db.Giveaway, reply_markup: InlineKey
                 link_preview_options=_post_link_preview(g), reply_markup=reply_markup,
             )
         except TelegramBadRequest as e:
-            has_custom = any(x.type == "custom_emoji" for x in entities or [])
-            if attempt or not has_custom or "emoji" not in str(e).lower():
+            if "emoji" not in str(e).lower() or attempt == 2:
                 raise
-            log.warning("Custom emoji rejected, resending post without it: %s", e)
-            entities = [x for x in entities if x.type != "custom_emoji"] or None
+            if _has_icons(reply_markup):
+                log.warning("Button icon rejected, sending without icons: %s", e)
+                _button_icons_disabled = True
+                reply_markup = _without_icons(reply_markup)
+            elif any(x.type == "custom_emoji" for x in entities or []):
+                log.warning("Custom emoji rejected, resending post without it: %s", e)
+                entities = [x for x in entities if x.type != "custom_emoji"] or None
+            else:
+                raise
     raise RuntimeError("unreachable")
 
 
@@ -264,19 +271,80 @@ def _overflow_message(over: int, has_photo: bool) -> str:
 
 # ── Keyboards ────────────────────────────────────────────
 
+# Animated custom emoji shown on the "Участвую!" button (gift, clover, bear, fireworks, …).
+# Admins set them with /icons (stored in settings); this list is only a code-level default.
+# One icon per giveaway, picked by id so it stays the same on counter refreshes.
+PARTICIPATE_ICONS: list[tuple[str, str]] = [
+    ("5449800250032143374", "🎁"),
+    ("5258040062028822951", "🍀"),
+    ("5206502842478638898", "🧸"),
+    ("5195100606250889609", "🎆"),
+    ("5461151367559141950", "🎉"),
+]
+_ICONS_SETTING = "participate_icons"
+# Set to True if Telegram rejects button icons once; then we stop sending them until restart.
+_button_icons_disabled = False
+
+
+def _participate_icons() -> list[tuple[str, str]]:
+    """[(custom_emoji_id, fallback_emoji)] from /icons, else the code default."""
+    raw = db.get_setting(_ICONS_SETTING)
+    if raw:
+        try:
+            items = json.loads(raw)
+            if isinstance(items, list):
+                return [(str(i[0]), str(i[1])) for i in items if isinstance(i, list) and len(i) == 2]
+        except ValueError:
+            pass
+    return list(PARTICIPATE_ICONS)
+
+
+def _participate_icon_ids() -> list[str]:
+    return [i for i, _ in _participate_icons()]
+
+
+def _plural_participants(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        word = "участник"
+    elif 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        word = "участника"
+    else:
+        word = "участников"
+    return f"{n} {word}"
+
+
+def _participate_icon(gid: int) -> str | None:
+    icons = _participate_icon_ids()
+    if _button_icons_disabled or not icons:
+        return None
+    return icons[gid % len(icons)]
+
+
 def _kb_participate(gid: int, count: int = 0) -> InlineKeyboardMarkup:
-    text = "Участвую! 🎲"
+    icon = _participate_icon(gid)
+    text = "Участвую!" if icon else "Участвую! 🎲"
     if count > 0:
         text += f" ({count})"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=text, callback_data=f"p:{gid}")],
+        [InlineKeyboardButton(text=text, callback_data=f"p:{gid}", icon_custom_emoji_id=icon, style="success")],
     ])
 
 
 def _kb_finished(gid: int, count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Завершён ✅ ({count})", callback_data=f"p:{gid}")],
+        [InlineKeyboardButton(text=f"🏁 Завершён · {_plural_participants(count)}", callback_data=f"p:{gid}")],
     ])
+
+
+def _without_icons(kb: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup | None:
+    if kb is None:
+        return None
+    rows = [[b.model_copy(update={"icon_custom_emoji_id": None}) for b in row] for row in kb.inline_keyboard]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _has_icons(kb: InlineKeyboardMarkup | None) -> bool:
+    return bool(kb) and any(b.icon_custom_emoji_id for row in kb.inline_keyboard for b in row)
 
 
 def _kb_control(gid: int, count: int) -> InlineKeyboardMarkup:
@@ -425,12 +493,19 @@ async def _do_button_update(gid: int) -> None:
     if not g or g.status != "active":
         return
     count = db.participant_count(gid)
+    global _button_icons_disabled
+    kb = _kb_participate(gid, count)
     try:
         await bot.edit_message_reply_markup(
             chat_id=g.channel_id,
             message_id=g.channel_message_id,
-            reply_markup=_kb_participate(gid, count),
+            reply_markup=kb,
         )
+    except TelegramBadRequest as e:
+        if _has_icons(kb) and "emoji" in str(e).lower():
+            log.warning("Button icon rejected, disabling icons: %s", e)
+            _button_icons_disabled = True
+            _schedule_button_update(gid)
     except Exception:
         pass
 
@@ -492,9 +567,14 @@ async def _show_main_menu(chat_id: int, message_id: int | None = None, user_id: 
     cd = _cooldown(country_code)
     bl_count = len(db.get_blacklist(country_code)) if country_code else 0
     bl_label = f"🚫 Чёрный список ({bl_count})" if bl_count else "🚫 Чёрный список"
+    active_count = len(db.get_all_active())
     buttons = [
         [InlineKeyboardButton(text="🎮 Мои игры", callback_data="show_games")],
         [InlineKeyboardButton(text="📚 Библиотека", callback_data="show_library")],
+    ]
+    if active_count:
+        buttons.insert(0, [InlineKeyboardButton(text=f"🟢 Активные ({active_count})", callback_data="show_active")])
+    buttons += [
         [InlineKeyboardButton(text=f"⏳ Кулдаун: {cd} мин", callback_data="show_cooldown")],
         [InlineKeyboardButton(text="🏆 Победители на кулдауне", callback_data="show_winners")],
         [InlineKeyboardButton(text="🔄 Сброс кулдауна", callback_data="reset_cooldowns")],
@@ -2032,7 +2112,7 @@ async def on_participate(cb: CallbackQuery) -> None:
     gid = int(cb.data.split(":")[1])
     g = db.get_giveaway(gid)
     if not g or g.status != "active":
-        await cb.answer("Розыгрыш завершён", show_alert=False)
+        await cb.answer(_finished_toast(gid))
         return
 
     user = cb.from_user
@@ -2040,10 +2120,19 @@ async def on_participate(cb: CallbackQuery) -> None:
     added = db.add_participant(gid, user.id, user.username, name)
 
     if added:
-        await cb.answer("🎲 Вы успешно зарегистрированы в розыгрыше!", show_alert=True)
+        await cb.answer(f"✅ Ты в розыгрыше! Участников: {db.participant_count(gid)}")
         _schedule_button_update(gid)
     else:
-        await cb.answer("Вы уже участвуете!", show_alert=False)
+        await cb.answer("Ты уже участвуешь ✅")
+
+
+def _finished_toast(gid: int) -> str:
+    winners = db.get_giveaway_winners(gid)
+    if not winners:
+        return "🏁 Розыгрыш завершён"
+    label = "Победитель" if len(winners) == 1 else "Победители"
+    text = f"🏁 Розыгрыш завершён. {label}: " + ", ".join(_display(w) for w in winners)
+    return text if len(text) <= 200 else text[:199] + "…"
 
 
 # ── Refresh participant count ────────────────────────────
@@ -2563,6 +2652,74 @@ async def cmd_cooldown(message: Message) -> None:
     await message.answer(f"✅ Кулдаун ({country_label}): {current} → {val} мин")
 
 
+# ── /icons — animated icons on the "Участвую!" button ───
+
+def _icons_preview(icons: list[tuple[str, str]]) -> tuple[str, list[MessageEntity]]:
+    """Text with each icon rendered as a custom emoji over its original fallback emoji."""
+    text, entities = "", []
+    for icon_id, char in icons:
+        offset = ig.utf16_len(text)
+        text += f"{char} "
+        entities.append(MessageEntity(
+            type="custom_emoji", offset=offset, length=ig.utf16_len(char), custom_emoji_id=icon_id,
+        ))
+    return text.strip(), entities
+
+
+def _custom_emojis(message: Message) -> list[tuple[str, str]]:
+    """Unique (custom_emoji_id, emoji_text) pairs from a message, in order."""
+    raw = (message.text or "").encode("utf-16-le")
+    seen: dict[str, str] = {}
+    for e in message.entities or []:
+        if e.type == "custom_emoji" and e.custom_emoji_id not in seen:
+            seen[e.custom_emoji_id] = raw[e.offset * 2:(e.offset + e.length) * 2].decode("utf-16-le")
+    return list(seen.items())
+
+
+@cmd_router.message(Command("icons"))
+async def cmd_icons(message: Message) -> None:
+    global _button_icons_disabled
+    if not is_admin(message.from_user.id):
+        return
+    arg = (message.text or "").split(maxsplit=1)
+    if len(arg) > 1 and arg[1].strip().lower() == "off":
+        db.set_setting(_ICONS_SETTING, "[]")
+        await message.answer("✅ Иконки на кнопке «Участвую!» выключены (будет 🎲).")
+        return
+
+    new_icons = _custom_emojis(message)
+    if new_icons:
+        db.set_setting(_ICONS_SETTING, json.dumps([list(p) for p in new_icons], ensure_ascii=False))
+        _button_icons_disabled = False
+        head = f"✅ Иконок на кнопке «Участвую!»: {len(new_icons)}. Каждый новый розыгрыш получает одну из них:\n\n"
+        text, entities = _icons_preview(new_icons)
+        shift = ig.utf16_len(head)
+        await message.answer(
+            head + text,
+            entities=[e.model_copy(update={"offset": e.offset + shift}) for e in entities],
+        )
+        return
+
+    current = _participate_icons()
+    help_text = (
+        "Отправь /icons и сразу за ним 5–7 анимированных эмодзи "
+        "(подарок, клевер, мишка, салют…) одним сообщением.\n/icons off — выключить."
+    )
+    if not current:
+        await message.answer(f"🎁 Иконки на кнопке «Участвую!» не заданы.\n\n{help_text}")
+        return
+    head = f"🎁 Сейчас иконок: {len(current)}"
+    if _button_icons_disabled:
+        head += " (Telegram их отклонил, до перезапуска не используются)"
+    head += "\n\n"
+    text, entities = _icons_preview(current)
+    shift = ig.utf16_len(head)
+    await message.answer(
+        f"{head}{text}\n\n{help_text}",
+        entities=[e.model_copy(update={"offset": e.offset + shift}) for e in entities],
+    )
+
+
 # ── /winners ─────────────────────────────────────────────
 
 @cmd_router.message(Command("winners"))
@@ -2955,6 +3112,7 @@ async def main() -> None:
         BotCommand(command="start", description="Главное меню"),
         BotCommand(command="blacklist", description="Чёрный список"),
         BotCommand(command="ban", description="Забанить по ID"),
+        BotCommand(command="icons", description="Иконки на кнопке «Участвую!»"),
     ])
 
     await _restore_timers()
