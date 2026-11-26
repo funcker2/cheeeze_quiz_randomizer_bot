@@ -128,15 +128,22 @@ def _format_winners_html(winners: list[db.Participant]) -> str:
     return "\n".join(lines)
 
 
+def _prize_summary(g: db.Giveaway, limit: int = 200) -> str:
+    """First non-empty line of the giveaway post: the prize itself, without the conditions below it."""
+    line = next((s.strip() for s in (g.prize_text or "").splitlines() if s.strip()), "")
+    return line[:limit] + ("…" if len(line) > limit else "")
+
+
 async def _send_result_to_channel(g: db.Giveaway, winners: list[db.Participant]) -> None:
     """Send winner announcement as a reply to the original giveaway post."""
     if not g.channel_id:
         return
-    # Sent as a reply to the giveaway post, so the prize is visible right above; don't repeat it.
-    announce = (
-        f"🎉 Итоги розыгрыша\n\n"
-        f"{_format_winners_html(winners)}"
-    )
+    # Sent as a reply to the giveaway post; still name the prize, since the reply preview is cut off.
+    announce = "🎉 Итоги розыгрыша\n\n"
+    prize = _prize_summary(g)
+    if prize:
+        announce += f"🎁 Приз: {html_module.escape(prize)}\n\n"
+    announce += _format_winners_html(winners)
     preview = None
     plain = announce
     if g.sponsor_instagram:
